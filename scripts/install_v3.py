@@ -17,6 +17,7 @@ SCRIPTS = ROOT / "template/.claude/scripts"
 START, END = "<!-- memrove-v3:start -->", "<!-- memrove-v3:end -->"
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "PreCompact", "SessionEnd")
 GLOBAL_EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop", "SessionEnd")
+JIT_EVENTS = (("SubagentStart", None), ("PreToolUse", "AskUserQuestion"), ("PostToolUse", "Write|Edit|MultiEdit"))
 SKILLS = ("memrove", "memrove-doctor")
 WRAPPER_MARK = "# memrove-v3 global wrapper"
 VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").is_file() else "3.0.0"
@@ -51,11 +52,12 @@ def load_json(path):
 
 
 def is_ours(handler):
-    return "memrove_v3_hook.py" in handler.get("command", "")
+    return any(n in handler.get("command", "") for n in ("memrove_v3_hook.py", "memrove_v3_jit.py"))
 
 
-def with_hooks(path, command, events, timeouts=None):
-    """settings JSON with every memrove handler replaced by `command` on `events` (None: just remove ours)."""
+def with_hooks(path, command, events, timeouts=None, jit=None):
+    """settings JSON with every memrove handler replaced by `command` on `events` (None: just remove ours); `jit` is the jit command
+    wired to SubagentStart, PreToolUse(AskUserQuestion) and PostToolUse(Write|Edit|MultiEdit)."""
     data = load_json(path)
     hooks = data.setdefault("hooks", {})
     for event in list(hooks):
@@ -67,6 +69,11 @@ def with_hooks(path, command, events, timeouts=None):
         group = {"hooks": [{"type": "command", "command": command, "timeout": (timeouts or {}).get(event, 3 if event == "SessionEnd" else 5)}]}
         if event == "PostToolUse":
             group["matcher"] = "Edit|Write|apply_patch"
+        hooks.setdefault(event, []).append(group)
+    for event, matcher in JIT_EVENTS if command and jit else ():
+        group = {"hooks": [{"type": "command", "command": jit, "timeout": 3}]}
+        if matcher:
+            group["matcher"] = matcher
         hooks.setdefault(event, []).append(group)
     if not hooks:
         del data["hooks"]
@@ -160,7 +167,8 @@ def install_global(vault, state, uninstall=False, settings=None, plan_only=False
     hook = Path(vault).resolve() / ".claude/scripts/memrove_v3_hook.py"
     cmd = None if uninstall else shlex.join([sys.executable, str(hook), "--vault", str(Path(vault).resolve()),
                                              "--state", str(state), "--harness", "claude", "--global"])
-    new = js(with_hooks(path, cmd, GLOBAL_EVENTS, {"UserPromptSubmit": 2}))
+    jit = shlex.join([sys.executable, str(hook.with_name("memrove_v3_jit.py")), "--state", str(state)])
+    new = js(with_hooks(path, cmd, GLOBAL_EVENTS, {"UserPromptSubmit": 2}, jit))
     out = {"settings": str(path), "status": "plan" if plan_only else "unchanged" if new == raw else
            "uninstalled" if uninstall else "installed"}
     if plan_only and not uninstall:

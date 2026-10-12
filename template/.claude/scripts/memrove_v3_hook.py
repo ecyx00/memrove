@@ -278,7 +278,8 @@ def session_notice(state, payload):
     elif source in ("resume", "clear"):
         from memrove_v3_jit import RULE
         notice += RULE + "\n"
-    return notice
+    from memrove_v3_heads import start_view  # the project's newest topic heads, inside the same view
+    return notice + start_view(state, payload.get("cwd") or ".")
 
 
 def spawn_worker(vault, state, harness):

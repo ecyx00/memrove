@@ -271,16 +271,18 @@ def merged(state, query, top=TOP, rerank=None, since=None, until=None, session_n
 
 def search(state, query, top=TOP, rerank=None, since=None, until=None, history=False):
     """The command's text: `head|...` lines (topic heads matching the query) first, then `id|date|kind|snippet` per hit, or a one-line note.
-    Entries a newer head replaced are hidden unless history=True."""
+    Entries a newer head replaced stay, after the unreplaced hits and tagged `[replaced by REF]` (history=True: no tag, no reordering)."""
     import memrove_v3_docsearch as docsearch   # imported here: docsearch imports this module
     import memrove_v3_heads as heads
     rows = merged(state, query, top, rerank, since, until)
     docs = docsearch.handles(state, query)
     top_heads = heads.match(state, query) if query.strip() else []
-    gone = set() if history else heads.heads(state)[1]
+    gone = {} if history else heads.heads(state)[1]
     shown = {h["id"] for h in top_heads}
-    rows = [r for r in rows if r[0] not in shown and r[0] not in gone]
-    docs = [d for d in docs if d.split("|")[2] not in gone]
+    rows = [r for r in rows if r[0] not in shown]
+    by = lambda d: next((v for k, v in gone.items() if k == d.split("|")[2] or k.endswith("/" + d.split("|")[2])), None)
+    docs = [d for d in docs if not by(d)] + [f"{d} [replaced by {by(d)}]" for d in docs if by(d)]
+    rows = [r for r in rows if r[0] not in gone] + [(i, d, f"{k} [replaced by {gone[i]}]", t) for i, d, k, t in rows if i in gone]
     out = "\n".join([f"head|{h['day']}|{h['topic']}{' ' + h['status'] if h['status'] else ''}|{h['ref']}|{snippet(h['decision'] + (' | next: ' + h['next'] if h['next'] else ''), query)}" for h in top_heads]
                     + [f"{i}|{(d or '')[:16].replace('T', ' ')}|{k}|{snippet(t, query)}" for i, d, k, t in rows]) if (rows or top_heads) else "no message matches"
     return out + ("\n\ndocs (open with memrove doc PATH [--section HEADING]; Read also works):\n" + "\n".join(docs) if docs else "")

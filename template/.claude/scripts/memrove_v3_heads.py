@@ -3,6 +3,7 @@ A deterministic view rebuilt on each call (no table, no LLM): the writer chose t
 render as replaced with a pointer to the head; nothing is deleted. An agent entry never replaces a --user record. Never raises."""
 import contextlib
 import json
+import os
 import re
 import sqlite3
 from datetime import date, timedelta
@@ -15,6 +16,13 @@ READ = 16000  # bytes of a write-up read for its front matter, title and verdict
 EXP = re.compile(r"^(e\d+)(?:-|$)")  # experiment prefix groups front-matter-less files: e87-arms, e87-job-set -> e87
 VERDICT = re.compile(r"verdict|result|outcome|summary|decision|finding", re.I)
 NEXT = re.compile(r"next|open|follow", re.I)
+VIEW_COUNT, VIEW_BYTES = 5, 1200  # the start view: newest heads of the current project, one line each, under a byte cap
+FM_LINE = "front matter at the top: topic (slug), status (open|done|rejected), decision (one sentence with why), next (one line)"
+
+
+def enabled():
+    """MEMROVE_HEADS=0 turns heads off everywhere: start view, project, search ranking, write-time check."""
+    return os.environ.get("MEMROVE_HEADS") != "0"
 
 
 def slug(text):
@@ -99,16 +107,20 @@ def entries(state, project=None):
 
 
 def build(items):
-    """-> (heads newest first, replaced {entry id: head/superseder id}). Pure."""
+    """-> (heads newest first, replaced {entry id: head/superseder id}). Pure. Only explicit keys replace (front-matter topic, supersedes,
+    remember --topic). Entries whose topic was derived from a filename group as "related": listed under the head (h["related"]), never replaced."""
     order = lambda e: (e["day"], e["ts"], e["id"])
     groups, replaced = {}, {}
     for e in items:
         groups.setdefault((e["project"], e["topic"]), []).append(e)
     heads = []
     for g in groups.values():
-        head = max([e for e in g if e["user"]] or g, key=order)  # an agent entry never replaces a --user one
-        heads.append(head)
-        replaced.update({e["id"]: head["id"] for e in g if e is not head and order(e) < order(head)})
+        keyed = [e for e in g if e["keyed"]]
+        pool = keyed or g
+        head = max([e for e in pool if e["user"]] or pool, key=order)  # an agent entry never replaces a --user one
+        replaced.update({e["id"]: head["id"] for e in keyed if e is not head and order(e) < order(head)})
+        rel = [e for e in g if e is not head and e["id"] not in replaced]
+        heads.append(dict(head, related=[e["ref"] for e in sorted(rel, key=order, reverse=True)]))
     by_id = {e["id"]: e for e in items}
     for e in sorted(items, key=order):  # explicit supersedes: record ids, write-up paths or topics
         for target in e["supersedes"]:
@@ -121,6 +133,8 @@ def build(items):
 
 
 def heads(state, project=None):
+    if not enabled():
+        return [], {}
     try:
         return build(entries(state, project))
     except Exception:
@@ -131,7 +145,7 @@ def line(h):
     bits = [f"[{h['topic']}]"] + ([h["status"]] if h["status"] else []) + ([h["kind"]] if h["kind"] in KINDS else [])
     text = " ".join(h["decision"].split())
     text = text if len(text) <= 200 else text[:199].rstrip() + "…"
-    return f"  {' '.join(bits)} {h['day']} {text}" + (f" | next: {' '.join(h['next'].split())[:100]}" if h["next"] else "") + f" | {h['ref']}"
+    return f"  {' '.join(bits)} {h['day']} {text}" + (f" | next: {' '.join(h['next'].split())[:100]}" if h["next"] else "") + f" | {h['ref']}" + (f" | related: {', '.join(h['related'][:3])}" if h.get("related") else "")
 
 
 def render(state, project, count=12):
@@ -172,3 +186,61 @@ def topicless_recent(days=7, today=None):
                 total += 1
                 bare += not e["keyed"]
     return total, bare
+
+
+def start_view(state, cwd, count=VIEW_COUNT, cap=VIEW_BYTES):
+    """SessionStart text: the newest `count` heads of the project at `cwd`, one line each (topic, status, decision, next), under `cap` bytes. '' when none."""
+    try:
+        from memrove_v3_project import project_name
+        hs, _ = heads(state, project_name(cwd, state))
+        out, size = [], 0
+        for h in hs[:count]:
+            bits = [f"[{h['topic']}]"] + ([h["status"]] if h["status"] else [])
+            ln = f"  {' '.join(bits)} {' '.join(h['decision'].split())[:160]}" + (f" | next: {' '.join(h['next'].split())[:80]}" if h["next"] else "")
+            if size + len(ln.encode()) + 1 > cap:
+                break
+            out.append(ln)
+            size += len(ln.encode()) + 1
+        return "heads (newest per topic):\n" + "\n".join(out) + "\n" if out else ""
+    except Exception:
+        return ""
+
+
+def _terms(text):
+    return {t for t in re.findall(r"[a-z0-9]{3,}", str(text).lower()) if not t.isdigit()}
+
+
+def check(state, path, text=None):
+    """PostToolUse check of a written docs/state write-up: '' or one line. No front matter (or a key missing) -> names the four keys plus up to 3
+    near existing topic slugs of the project; a new topic with a near existing slug -> 'existing topics: ...'. Deterministic, never raises."""
+    try:
+        if not enabled():
+            return ""
+        import fnmatch
+        import memrove_v3_docs as docs
+        path = Path(path)
+        if not fnmatch.fnmatch(path.as_posix(), "*/docs/state/*.md"):
+            return ""
+        if text is None:
+            with path.open(encoding="utf-8", errors="replace") as f:
+                text = f.read(READ)
+        base = next(p for p in path.parents if p.name == "state" and p.parent.name == "docs")
+        project = base.parent.parent.name
+        fm = docs.front_matter(text)
+        mine = _writeup(path, project, base)
+        items = [e for e in _records(state) if e["project"] == project] if state and (Path(state) / "memory.sqlite3").exists() else []
+        items += [e for e in (_writeup(p, project, base) for p in sorted(base.rglob("*.md")) if p != path) if e]
+        known = []
+        for e in sorted(items, key=lambda e: (e["day"], e["ts"]), reverse=True):  # explicit keys only, newest first
+            if e["keyed"] and e["topic"] not in known:
+                known.append(e["topic"])
+        query = _terms(path.stem.replace("-", " ") + " " + (mine["decision"] if mine else "") + " " + (fm.get("topic") or "").replace("-", " "))
+        scored = sorted(((-len(query & _terms(t.replace("-", " "))), t) for t in known if t != slug(fm.get("topic"))), key=lambda s: s[0])
+        near = [t for n, t in scored if n < 0][:3]
+        if not {"topic", "status", "decision", "next"} <= set(fm):
+            return "write-up needs " + FM_LINE + (f"; existing topics: {', '.join(near)}" if near else "")
+        if slug(fm["topic"]) not in known and near:
+            return f"existing topics: {', '.join(near)} (reuse one if this continues it)"
+        return ""
+    except Exception:
+        return ""

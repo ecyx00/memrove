@@ -90,7 +90,8 @@ class TopicHeads(unittest.TestCase):
         self.assertRegex(out, r"\[ingest-queue\] [^\n]*pelican stream[^\n]*rec:" + new)
         self.assertNotIn("zebrafish queue for ingestion (why", out)  # replaced entry is not a head
         s = self.cli("search", "ingestion zebrafish queue").stdout
-        self.assertNotIn("rec:" + old, s)
+        self.assertRegex(s, r"rec:" + old + r"\|[^\n]*\[replaced by rec:" + new)  # stays in search, tagged
+        self.assertGreater(s.index("rec:" + old), s.index("head|"))  # below the head
         self.assertIn("rec:" + old, self.cli("search", "ingestion zebrafish queue", "--history").stdout)
         s = self.cli("search", "pelican stream adapter").stdout.splitlines()
         self.assertTrue(s[0].startswith("head|"), s)  # the head sits above raw hits
@@ -116,7 +117,8 @@ class TopicHeads(unittest.TestCase):
         by = {h["topic"]: h for h in hs}
         self.assertEqual(sorted(by), ["e87", "plain-note"])
         self.assertEqual(by["e87"]["ref"], "docs/state/2026-10-05-e87-baseline-v2-report.md")
-        self.assertEqual(list(rep.values()), [by["e87"]["id"]])
+        self.assertEqual(rep, {})  # backfilled topics group as related, never replaced
+        self.assertEqual(by["e87"]["related"], ["docs/state/2026-10-01-e87-arms.md"])
         self.assertEqual(by["e87"]["decision"], "Baseline holds at 0.68.")
         self.assertEqual(by["e87"]["next"], "Run the reader once")
         self.assertEqual(by["plain-note"]["decision"], "First real line here.")
@@ -152,6 +154,94 @@ class TopicHeads(unittest.TestCase):
         import memrove_v3_jit as jit
         self.assertIn("front matter: topic", jit.SUBAGENT_RULE)
         self.assertEqual(jit.RULE.count("front matter"), 1)
+
+    def test_h3_backfilled_facets_stay_visible(self):
+        import memrove_v3_heads as H
+        (self.docs / "2026-10-01-e87-job-set.md").write_text("# Job set\n\nThe job set is fixed. More.\n")
+        (self.docs / "2026-10-05-e87-arms.md").write_text("# Arms\n\nThree arms. More.\n")
+        hs, rep = H.heads(self.state, "myproj")
+        self.assertEqual(rep, {})
+        self.assertIn("e87-job-set", " ".join(hs[0]["related"]))
+        self.assertIn("related: docs/state/2026-10-01-e87-job-set.md", H.line(hs[0]))
+        (self.docs / "2026-10-06-e87-arms-v2.md").write_text("---\ntopic: e87-arms\n---\n")  # an explicit key still replaces keyed entries only
+        (self.docs / "2026-10-07-e87-arms-v3.md").write_text("---\ntopic: e87-arms\n---\n")
+        _, rep = H.heads(self.state, "myproj")
+        self.assertEqual(list(rep), [str(self.docs / "2026-10-06-e87-arms-v2.md")])
+
+    def test_h1_start_view_newest_five_capped_and_empty(self):
+        import memrove_v3_heads as H
+        import memrove_v3_hook as hook
+        payload = {"source": "startup", "cwd": str(self.proj)}
+        self.assertNotIn("heads", hook.session_notice(self.state, payload))
+        for i in range(7):
+            (self.docs / f"2026-10-0{i + 1}-t{i}.md").write_text(f"---\ntopic: topic-{i}\nstatus: open\ndecision: decision number {i}\nnext: do {i}\n---\n")
+        out = hook.session_notice(self.state, payload)
+        self.assertIn("[topic-6] open decision number 6 | next: do 6", out)
+        self.assertIn("[topic-2]", out)
+        self.assertNotIn("[topic-1]", out)
+        self.assertEqual(H.start_view(self.state, str(self.proj), cap=60).count("[topic-"), 1)  # cap drops lines, never cuts one
+        self.assertEqual(H.start_view(self.state, str(self.proj.parent)), "")  # another cwd, no heads
+
+    def test_h2_write_time_check(self):
+        import memrove_v3_jit as jit
+        (self.docs / "2026-10-01-ingest-queue.md").write_text("---\ntopic: ingest-queue\nstatus: open\ndecision: x\nnext: y\n---\n")
+        bare = self.docs / "2026-10-13-ingest-queue-retry.md"
+        bare.write_text("# Ingest queue retry\n\nbody\n")
+        call = lambda path, tool="Write": jit.handle({"hook_event_name": "PostToolUse", "tool_name": tool, "tool_input": {"file_path": str(path)}}, str(self.state))
+        out = call(bare)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "PostToolUse")
+        for key in ("topic", "status", "decision", "next"):
+            self.assertIn(key, out["additionalContext"])
+        self.assertIn("existing topics: ingest-queue", out["additionalContext"])
+        self.assertEqual(out["additionalContext"].count("\n"), 0)
+        new = self.docs / "2026-10-13-queue-retry.md"
+        new.write_text("---\ntopic: queue-retry\nstatus: open\ndecision: d\nnext: n\n---\n")
+        self.assertIn("existing topics: ingest-queue", call(new, "Edit")["hookSpecificOutput"]["additionalContext"])
+        ok = self.docs / "2026-10-13-ingest-queue-b.md"
+        ok.write_text("---\ntopic: ingest-queue\nstatus: open\ndecision: d\nnext: n\n---\n")
+        self.assertIsNone(call(ok))
+        self.assertIsNone(call(self.proj / "README.md"))
+        self.assertIsNone(call(self.docs / "missing.md"))
+        self.assertIsNone(call(bare, "Read"))
+        with mock.patch.dict(os.environ, {"MEMROVE_HEADS": "0"}):
+            self.assertIsNone(call(bare))
+        r = subprocess.run([sys.executable, str(ROOT / "template/.claude/scripts/memrove_v3_jit.py"), "--state", str(self.state)], input=json.dumps(
+            {"hook_event_name": "PostToolUse", "tool_name": "MultiEdit", "tool_input": {"file_path": str(bare)}}), env=self.env, capture_output=True, text=True)
+        self.assertIn("additionalContext", r.stdout)
+
+    def test_h4_installer_wires_jit_idempotently(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import install_v3
+        settings = Path(self.tmp.name) / "settings.json"
+        settings.write_text(json.dumps({"hooks": {"SubagentStart": [{"hooks": [{"type": "command", "command": "other"}]}]}}))
+        kw = dict(settings=settings, bin_dir=Path(self.tmp.name) / "bin")
+        install_v3.install_global(self.vault, self.state, **kw)
+        first = settings.read_text()
+        self.assertEqual(install_v3.install_global(self.vault, self.state, **kw)["status"], "unchanged")
+        hooks = json.loads(first)["hooks"]
+        jit = [(e, g.get("matcher")) for e, gs in hooks.items() for g in gs for h in g["hooks"] if "memrove_v3_jit.py" in h["command"]]
+        self.assertEqual(sorted(jit, key=str), sorted([("SubagentStart", None), ("PreToolUse", "AskUserQuestion"), ("PostToolUse", "Write|Edit|MultiEdit")], key=str))
+        self.assertEqual(len(hooks["SubagentStart"]), 2)  # the foreign entry stays
+        install_v3.install_global(self.vault, self.state, uninstall=True, **kw)
+        self.assertNotIn("memrove", settings.read_text())
+
+    def test_h5_kill_switch_everywhere_and_doctor_share(self):
+        import memrove_v3_heads as H
+        import memrove_v3_hook as hook
+        today = date.today().isoformat()
+        (self.docs / f"{today}-a.md").write_text("---\ntopic: a\nstatus: open\ndecision: d\nnext: n\n---\n")
+        (self.docs / f"{today}-b.md").write_text("# b\n")
+        self.assertIn("front matter on 1/2 (50%)", self.cli("doctor").stdout)
+        self.remember("Anything to make the project known", "known-topic")
+        env = dict(self.env, MEMROVE_HEADS="0")
+        with mock.patch.dict(os.environ, {"MEMROVE_HEADS": "0"}):
+            self.assertEqual(H.heads(self.state, "myproj"), ([], {}))
+            self.assertEqual((H.render(self.state, "myproj"), H.topics(self.state, "myproj"), H.match(self.state, "a")), ([], [], []))
+            self.assertNotIn("heads", hook.session_notice(self.state, {"source": "startup", "cwd": str(self.proj)}))
+        on = subprocess.run([sys.executable, str(ROOT / "scripts/memrove_v3.py"), "--vault", str(self.vault), "--state", str(self.state), "project", "myproj"], env=self.env, capture_output=True, text=True).stdout
+        off = subprocess.run([sys.executable, str(ROOT / "scripts/memrove_v3.py"), "--vault", str(self.vault), "--state", str(self.state), "project", "myproj"], env=env, capture_output=True, text=True).stdout
+        self.assertIn("heads (newest", on)
+        self.assertNotIn("heads (newest", off)
 
 
 if __name__ == "__main__":

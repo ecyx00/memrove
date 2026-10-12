@@ -371,7 +371,9 @@ def cmd_doctor(args, ctx):
     def topic_heads():
         import memrove_v3_heads
         total, bare = memrove_v3_heads.topicless_recent()
-        return {"writeups_7d": total, "without_topic": bare, "line": f"{bare} write-ups in the last 7 days without a topic"}
+        return {"writeups_7d": total, "without_topic": bare, "front_matter_share": round((total - bare) / total, 2) if total else None,
+                "heads": "off (MEMROVE_HEADS=0)" if not memrove_v3_heads.enabled() else "on",
+                "line": f"{bare} write-ups in the last 7 days without a topic" + (f"; front matter on {total - bare}/{total} ({round(100 * (total - bare) / total)}%)" if total else "")}
     _guarded(report, "topic_heads", topic_heads)
     _guarded(report, "llm", lambda: memrove_v3_llm.doctor(store))
     _guarded(report, "context_health", lambda: memrove_v3_health.report(state))
