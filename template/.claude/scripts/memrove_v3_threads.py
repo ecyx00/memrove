@@ -6,6 +6,7 @@ reasons, open items, evidence links) merged section by section, not a log. Atomi
 """
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from datetime import timedelta
@@ -25,6 +26,11 @@ DORMANT_DAYS = 14  # a thread without a linked session for this long is hidden f
 WIKI_RE = re.compile(r"\[\[[^\]]+\]\]")
 STATUSES = ("active", "waiting", "closed")
 INDEX = "threads-index.json"  # state dir: record id -> thread, read by recall (the hook has no vault path)
+
+
+def enabled():
+    """Via negativa (topic heads): the thread / session-card / Last-Session writers and their surfaces are off. MEMROVE_THREADS=1 turns them back on."""
+    return os.environ.get("MEMROVE_THREADS") == "1"
 
 
 def _proj(m):

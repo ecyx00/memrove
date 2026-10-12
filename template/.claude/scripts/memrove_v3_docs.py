@@ -44,6 +44,27 @@ def _terms(text):
     return [w for w in WORD.findall(text.lower()) if w not in STOP]
 
 
+FM_KEYS = ("topic", "status", "decision", "next", "supersedes")
+FM_STATUS = ("open", "done", "rejected")
+
+
+def front_matter(text):
+    """Leading `---` block of a write-up -> {topic, status, decision, next, supersedes} (only the keys present and valid).
+    One `key: value` per line, no nesting; deterministic, no YAML library."""
+    m = re.match(r"\A---\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", text, re.S)
+    out = {}
+    for ln in (m.group(1).splitlines() if m else []):
+        k, sep, v = ln.partition(":")
+        k, v = k.strip().lower(), v.strip().strip("\"'").strip()
+        if sep and k in FM_KEYS and v:
+            out[k] = v
+    if out.get("status", "").lower() not in FM_STATUS:
+        out.pop("status", None)
+    elif "status" in out:
+        out["status"] = out["status"].lower()
+    return out
+
+
 def classify(rel, text):
     """Deterministic kind from filename, then title, then headings. No pattern -> note."""
     stem = Path(rel).stem
@@ -113,7 +134,7 @@ def _parse(repo, p, project, mtime, size):
         tf[w] += 3
     data = {"areas": areas[:8], "wiki": sorted(set(w.strip() for w in WIKI.findall(text)))[:8],
             "tf": dict(tf.most_common(80)),
-            "sha": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]}
+            "sha": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16], "fm": front_matter(text)}
     return (f"doc:{project}/{rel}", project, rel, mtime, size, classify(rel, text), _title(rel, text),
             _summary(text), _day(rel, text), json.dumps(data, sort_keys=True))
 

@@ -269,10 +269,18 @@ def merged(state, query, top=TOP, rerank=None, since=None, until=None, session_n
     return [row for _, row in both][:top]
 
 
-def search(state, query, top=TOP, rerank=None, since=None, until=None):
-    """The command's text: `id|date|kind|snippet` per hit, or a one-line note."""
+def search(state, query, top=TOP, rerank=None, since=None, until=None, history=False):
+    """The command's text: `head|...` lines (topic heads matching the query) first, then `id|date|kind|snippet` per hit, or a one-line note.
+    Entries a newer head replaced are hidden unless history=True."""
     import memrove_v3_docsearch as docsearch   # imported here: docsearch imports this module
+    import memrove_v3_heads as heads
     rows = merged(state, query, top, rerank, since, until)
     docs = docsearch.handles(state, query)
-    out = "\n".join(f"{i}|{(d or '')[:16].replace('T', ' ')}|{k}|{snippet(t, query)}" for i, d, k, t in rows) if rows else "no message matches"
+    top_heads = heads.match(state, query) if query.strip() else []
+    gone = set() if history else heads.heads(state)[1]
+    shown = {h["id"] for h in top_heads}
+    rows = [r for r in rows if r[0] not in shown and r[0] not in gone]
+    docs = [d for d in docs if d.split("|")[2] not in gone]
+    out = "\n".join([f"head|{h['day']}|{h['topic']}{' ' + h['status'] if h['status'] else ''}|{h['ref']}|{snippet(h['decision'] + (' | next: ' + h['next'] if h['next'] else ''), query)}" for h in top_heads]
+                    + [f"{i}|{(d or '')[:16].replace('T', ' ')}|{k}|{snippet(t, query)}" for i, d, k, t in rows]) if (rows or top_heads) else "no message matches"
     return out + ("\n\ndocs (open with memrove doc PATH [--section HEADING]; Read also works):\n" + "\n".join(docs) if docs else "")

@@ -352,7 +352,7 @@ def _t(text, n):
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
-def entry(db, vault, project, limit=5000, decisions=6, old=3):
+def entry(db, vault, project, limit=5000, decisions=6, old=3, state=None):
     """Where a project stands, in plain lines that each start with an id `memrove show <id>` opens: the latest decisions (the ones a later
     record or a supersedes edge replaced are marked), open loops (grab cards flagged open, open threads), the last session's end state.
     Built from stored facts only (no model call); `limit` bytes cap the whole text, each section keeps its own share."""
@@ -373,6 +373,9 @@ def entry(db, vault, project, limit=5000, decisions=6, old=3):
     cur = [n for n in decs if n["id"] not in newer and n.get("status") != "superseded"]
     gone = [n for n in decs if n not in cur]
     out = [f"project {name}"]
+    if state:
+        import memrove_v3_heads as heads
+        out += heads.render(state, name)
     out.append("decisions (latest first):" if decs else "decisions: none recorded")
     for n in cur[:decisions]:
         out.append(f"  rec:{n['id']} {n['day']} {_t(n['title'], 110)}")
@@ -382,7 +385,7 @@ def entry(db, vault, project, limit=5000, decisions=6, old=3):
     names = {name, *(str(project).split("/")[-1:] if project else [])}
     loops = sorted((n for n in mine if n["kind"] == "card" and n.get("open")), key=order, reverse=True)
     try:
-        open_threads = th.inject_items(vault, names, limit=6)
+        open_threads = th.inject_items(vault, names, limit=6) if th.enabled() else []
     except Exception:  # ponytail: companion files are best-effort, the rest still answers
         open_threads = []
     if loops or open_threads:
@@ -390,7 +393,7 @@ def entry(db, vault, project, limit=5000, decisions=6, old=3):
         out += [f"  rec:{n['id']} {n['day']} {_t(n['title'], 110)}" for n in loops[:5]]
         out += [f"  {short}" for _id, _full, short in open_threads]
     try:
-        last = th.last_card(vault, names)
+        last = th.last_card(vault, names) if th.enabled() else []
     except Exception:
         last = []
     if last:

@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 
 STALE_S = 24 * 3600
-WRITERS = ("chatlog", "chattree", "j2_records", "j2_threads", "grab_process")  # docsearch refresh is lazy (on query), not a background writer
+WRITERS = ("chatlog", "chattree", "j2_records", "grab_process")  # docsearch refresh is lazy (on query), not a background writer
 
 
 def _path(state, writer):

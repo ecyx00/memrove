@@ -583,6 +583,8 @@ def _thread_prompt(vault, ev, text):
     """The window text, headed by the project's open threads so J2 can attach to them. Never raises."""
     try:
         import memrove_v3_threads as th
+        if not th.enabled():
+            return text
         path = _companion_file(vault, "Threads.md")
         return th.active_for_prompt(path, ev.get("project") or "unknown")[0] + "\n\n" + text if path else text
     except Exception:
@@ -592,6 +594,8 @@ def _thread_prompt(vault, ev, text):
 def _thread_files(vault, state, data, ev, sid, new, day, links):
     """J2's threads/card -> Threads.md and Last-Session.md. Only memrove-marked blocks are touched. Never raises into the note."""
     import memrove_v3_threads as th
+    if not th.enabled():
+        return
     project = ev.get("project") or "unknown"
     ups = [u for u in (data.get("threads") or []) if isinstance(u, dict)] if isinstance(data.get("threads"), list) else []
     from memrove_v3_capture import has_secret

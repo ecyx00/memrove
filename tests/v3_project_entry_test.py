@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """E73: `memrove project` answers where a project stands from stored facts: current vs superseded decisions, open loops, last end state, size cap."""
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'template/.claude/scripts'))
 sys.dont_write_bytecode = True
+os.environ['MEMROVE_THREADS'] = '1'  # the legacy thread/card writers are off by default (topic heads); these tests cover them
 import memrove_v3_project as P  # noqa: E402
 import memrove_v3_threads as th  # noqa: E402
 from memrove_v3_sync import SyncEngine  # noqa: E402

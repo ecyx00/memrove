@@ -109,6 +109,7 @@ COMMANDS = {
     "search": ("Chat messages and saved records in one ranked list: id|date|kind|snippet (rec:<id> for a record)", [
         opt("query", nargs="?", default=""), opt("--limit", type=int, help="hits (default 8; with --records 10)"),
         opt("--since", help="only from this date on (YYYY-MM-DD or ISO datetime)"), opt("--until", help="only up to this date, inclusive"),
+        opt("--history", action="store_true", help="also show entries a newer topic head replaced"),
         opt("--records", action="store_true", help="records only, all kinds, JSON"),
         opt("--compact", action="store_true", help="with --records: one line per hit")]),
     "show": ("One memory in full (id or unique prefix from a recall card)", [opt("id")]),
@@ -131,6 +132,7 @@ COMMANDS = {
         opt("--user", action="store_true", help="the text quotes the user verbatim (origin user_explicit)"),
         opt("--session", help="default: CLAUDE_CODE_SESSION_ID, else the newest transcript of --cwd"),
         opt("--supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; repeatable"),
+        opt("--topic", help="slug of the topic this decision belongs to; the newest entry per topic is its head (the nudge lists existing slugs)"),
         opt("--cwd", default=".")]),
 }
 
@@ -244,7 +246,7 @@ def cmd_project(args, ctx):
         print("no project for this directory; pass a name", file=sys.stderr)
         return 2
     with ctx.store()._connect() as db:
-        print(project.entry(db, ctx.vault, name, args.max_bytes))
+        print(project.entry(db, ctx.vault, name, args.max_bytes, state=ctx.state))
     return 0
 
 
@@ -366,6 +368,11 @@ def cmd_doctor(args, ctx):
     report["secrets_redacted"] = report["secret_filter"]["total"]
     _guarded(report, "writers", lambda: memrove_v3_heartbeat.check(state))
     _guarded(report, "docs", lambda: memrove_v3_docs.doctor(store))
+    def topic_heads():
+        import memrove_v3_heads
+        total, bare = memrove_v3_heads.topicless_recent()
+        return {"writeups_7d": total, "without_topic": bare, "line": f"{bare} write-ups in the last 7 days without a topic"}
+    _guarded(report, "topic_heads", topic_heads)
     _guarded(report, "llm", lambda: memrove_v3_llm.doctor(store))
     _guarded(report, "context_health", lambda: memrove_v3_health.report(state))
     _guarded(report, "companion_hygiene", lambda: companion.hygiene(ctx.vault, state))
@@ -412,7 +419,7 @@ def cmd_search(args, ctx):
     if not args.query.strip() and not (args.since or args.until):
         raise ValueError("search needs a query or --since / --until")
     import memrove_v3_chatsearch as chat_search
-    print(chat_search.search(ctx.state, args.query, *([args.limit] if args.limit else []), since=args.since, until=args.until))
+    print(chat_search.search(ctx.state, args.query, *([args.limit] if args.limit else []), since=args.since, until=args.until, history=args.history))
     return 0
 
 
@@ -426,7 +433,7 @@ def cmd_remember(args, ctx):
     cwd = Path(args.cwd).expanduser().resolve()
     project = args.project or project_name(cwd, ctx.state)
     result = remember(ctx.engine(), args.kind, args.text, args.why, project, args.user,
-                      args.session or current_session(cwd), supersedes=args.supersedes)
+                      args.session or current_session(cwd), supersedes=args.supersedes, topic=args.topic)
     if result["status"] == "exists":
         print(result["id"] + " (exists)", file=sys.stderr)
     print(result["id"])
@@ -436,6 +443,14 @@ def cmd_remember(args, ctx):
             for line in nudge(ctx.state, project, args.text, exclude=result["id"]):
                 print(line, file=sys.stderr)
         except Exception:  # the nudge is a courtesy; the record is already saved
+            pass
+    if args.kind in ("decision", "rejected"):
+        try:
+            from memrove_v3_nudge import topic_line
+            line = topic_line(ctx.state, project)
+            if line:
+                print(line, file=sys.stderr)
+        except Exception:
             pass
     return 0
 

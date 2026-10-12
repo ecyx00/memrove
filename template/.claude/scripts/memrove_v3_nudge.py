@@ -32,3 +32,13 @@ def nudge(state, project, text, exclude=None, n=3):
         return [f"may replace: rec:{i} ({d} {t}) (rerun with --supersedes {i})" for _, d, i, t in sorted(scored)[:n]]
     except Exception:
         return []
+
+
+def topic_line(state, project, n=8):
+    """'topics of <project> (reuse with --topic): a, b, c' (most recent first), or '' when it has none. Never raises."""
+    try:
+        from memrove_v3_heads import topics
+        t = topics(state, project, n)
+        return f"topics of {project} (reuse with --topic): " + ", ".join(t) if t else ""
+    except Exception:
+        return ""

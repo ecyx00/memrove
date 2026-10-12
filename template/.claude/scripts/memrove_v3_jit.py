@@ -8,7 +8,8 @@ import sys
 
 RULE = (
     "Before you answer or start a task that may build on earlier work, search first; a hit or a doc line is a lead, not evidence; "
-    "open it with zoom or memrove doc and answer from what you opened. On one topic the newer statement wins, and the user's word beats an agent's."
+    "open it with zoom or memrove doc and answer from what you opened. On one topic the newer statement wins, and the user's word beats an agent's. "
+    "Start every docs/state write-up with front matter: topic (slug), status (open|done|rejected), decision (one sentence with why), next (one line)."
 )
 SUBAGENT_RULE = RULE + ' Without the MCP tools use the CLI: memrove search "<words>" / memrove zoom <id> <n>.'
 ASK_HINT = ("Before you ask the owner, check memory: `memrove search` for this decision; "

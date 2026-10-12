@@ -31,12 +31,12 @@ class HeartbeatTest(unittest.TestCase):
             f.write(json.dumps({'i': 1, 'kind': 'user', 'text': 'merhaba', 'date': when.astimezone().isoformat()}) + '\n')
 
     def test_silent_writer_with_new_messages_gets_one_line(self):
-        hb.stamp(self.state, 'j2_threads', now=NOW - 50 * 3600)
+        hb.stamp(self.state, 'j2_records', now=NOW - 50 * 3600)
         hb.stamp(self.state, 'chatlog', now=NOW - 1 * 3600)
         self.message(datetime.fromtimestamp(NOW - 3600))
         text = hb.line(self.state, NOW)
         self.assertEqual(text.count('\n'), 1)
-        self.assertIn('j2_threads', text)
+        self.assertIn('j2_records', text)
         self.assertNotIn('chatlog', text)
 
     def test_healthy_state_adds_nothing(self):
@@ -47,10 +47,10 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(hb.line(Path(self.tmp.name) / 'never-ran', NOW), '')
 
     def test_idle_writer_without_new_messages_is_healthy(self):
-        hb.stamp(self.state, 'j2_threads', now=NOW - 50 * 3600)
+        hb.stamp(self.state, 'j2_records', now=NOW - 50 * 3600)
         self.message(datetime.fromtimestamp(NOW - 60 * 3600))  # older than its last success
         self.assertEqual(hb.line(self.state, NOW), '')
-        self.assertEqual({r['writer']: r['status'] for r in hb.check(self.state, NOW)}['j2_threads'], 'idle')
+        self.assertEqual({r['writer']: r['status'] for r in hb.check(self.state, NOW)}['j2_records'], 'idle')
 
     def test_writer_that_never_ran_is_flagged_after_24h_with_new_messages(self):
         (self.state / 'heartbeat').mkdir(parents=True)
@@ -60,10 +60,10 @@ class HeartbeatTest(unittest.TestCase):
         text = hb.line(self.state, NOW)
         self.assertEqual(text.count('\n'), 1)
         self.assertIn('chattree', text)
-        self.assertIn('j2_threads', text)
+        self.assertIn('j2_records', text)
         self.assertNotIn('chatlog', text)
         self.assertNotIn('grab_process', text)
-        self.assertEqual({r['writer']: r['status'] for r in hb.check(self.state, NOW)}['j2_threads'], 'never ran')
+        self.assertEqual({r['writer']: r['status'] for r in hb.check(self.state, NOW)}['j2_records'], 'never ran')
 
     def test_never_ran_is_quiet_before_24h_or_without_new_messages(self):
         (self.state / 'heartbeat').mkdir(parents=True)

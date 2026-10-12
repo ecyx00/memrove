@@ -129,7 +129,7 @@ def context_pack(store, task, project=None, scope="all", budget=800, client="cla
 REMEMBER_KINDS = ("decision", "rejected", "lesson", "preference", "note")
 
 
-def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=()):
+def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None):
     """Model-written memory: same observe contract (validate, commit, readback), core kinds allowed. Idempotent on (kind, text)."""
     from memrove_v3_capture import has_secret, key_of
     if kind not in REMEMBER_KINDS:
@@ -153,6 +153,10 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
         payload["session"] = session
     if kind == "rejected":
         payload["polarity"] = "neg"
+    if topic:  # the writer's key: the newest decision/rejected per (project, topic) is the head (memrove_v3_heads)
+        from memrove_v3_heads import slug
+        if slug(topic):
+            payload["topic"] = slug(topic)
     if supersedes:  # the record(s) this one replaces; each must exist (unique id or prefix)
         with sync.store._connect() as db:
             found = []
