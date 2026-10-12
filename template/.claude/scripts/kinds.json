@@ -1,0 +1,32 @@
+{
+  "task": {"observable": false, "scope": "project"},
+  "session": {"observable": false, "scope": "project"},
+  "decision": {"observable": false, "scope": "project"},
+  "rejected": {"observable": false, "scope": "project"},
+  "lesson": {"observable": false, "scope": "project"},
+  "papercut": {"observable": false, "scope": "technical"},
+  "preference": {"observable": false, "scope": "user"},
+  "inference": {"observable": false, "scope": "user"},
+  "entity": {"observable": false, "scope": "technical"},
+  "doc": {"observable": false, "scope": "project"},
+  "reference": {"observable": false, "scope": "project"},
+  "receipt": {"observable": false, "scope": "project"},
+  "note": {"observable": true, "scope": "project", "required": ["text"]},
+  "idea": {
+    "observable": true, "scope": "personal", "required": ["title", "text"], "initial": "raw",
+    "states": ["raw", "researched", "incubating", "active", "paused", "archived", "superseded"],
+    "transitions": {
+      "raw": ["researched", "archived", "superseded"],
+      "researched": ["incubating", "archived", "superseded"],
+      "incubating": ["active", "paused", "archived", "superseded"],
+      "active": ["paused", "archived", "superseded"],
+      "paused": ["active", "archived", "superseded"],
+      "archived": [],
+      "superseded": []
+    }
+  },
+  "claim": {"observable": true, "scope": "project", "required": ["text"]},
+  "evidence": {"observable": true, "scope": "project", "required": ["text"]},
+  "finding": {"observable": true, "scope": "project", "required": ["title", "text"]},
+  "learning_session": {"observable": true, "scope": "learning", "required": ["topic", "text"]}
+}

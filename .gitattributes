@@ -1,0 +1,3 @@
+# Scripts and hooks need LF: a CRLF checkout breaks shell shebangs.
+* text=auto eol=lf
+*.png binary

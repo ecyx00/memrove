@@ -1,0 +1,32 @@
+{
+  "name": "memrove-chat",
+  "version": "0.5.0",
+  "description": "Drives memrove's chat memory from inside Claude Code: after each turn it compacts the chat log with Haiku on the session's own auth, and gives the model zoom, date and search tools.",
+  "license": "MIT",
+  "userConfig": {
+    "memrove": {
+      "type": "string",
+      "title": "memrove command",
+      "description": "The command that runs memrove, split on spaces (no quoting). Example: python3 /path/to/scripts/memrove_v3.py --vault /path/vault --state /path/state",
+      "default": "memrove"
+    },
+    "batches": {
+      "type": "number",
+      "title": "Batches per turn",
+      "description": "At most this many compaction batches (one Haiku call each) after a turn.",
+      "default": 3
+    },
+    "model": {
+      "type": "string",
+      "title": "Compactor model",
+      "description": "The model alias for the compaction calls.",
+      "default": "haiku"
+    },
+    "fresh": {
+      "type": "boolean",
+      "title": "Fresh context per turn",
+      "description": "After a turn, compact the session to the chat view plus the last exchange. Experimental; off by default.",
+      "default": false
+    }
+  }
+}

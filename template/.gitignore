@@ -1,0 +1,17 @@
+# Secrets: never commit
+.claude/settings.local.json
+.env
+*.bak
+*.orig
+
+# Local runtime state
+.claude/hooks/.state/
+.claude/scripts/.state/*
+!.claude/scripts/.state/.gitkeep
+
+# OS and editor noise
+.DS_Store
+.obsidian/workspace*
+.obsidian/cache
+__pycache__/
+*.pyc

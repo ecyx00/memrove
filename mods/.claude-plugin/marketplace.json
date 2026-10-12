@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "memrove-mods",
+  "description": "Claude Code mods that drive memrove's local memory.",
+  "owner": { "name": "memrove" },
+  "plugins": [
+    {
+      "name": "memrove-chat",
+      "source": "./memrove-chat",
+      "description": "Compacts memrove's chat log with Haiku after each turn on the session's own auth, puts the chat view in the context, and gives the model zoom and date tools.",
+      "category": "productivity",
+      "tags": ["mods", "function-hooks", "memory"]
+    }
+  ]
+}

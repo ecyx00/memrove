@@ -1,0 +1,4 @@
+{
+  "description": "Drives memrove's chat memory from inside Claude Code: after each turn it compacts the chat log with Haiku on the session's own auth, and gives the model zoom and date tools.",
+  "modules": ["./register.ts"]
+}
