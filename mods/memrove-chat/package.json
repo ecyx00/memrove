@@ -1,5 +1,5 @@
 {
-  "name": "MOD_NAME",
+  "name": "memrove-chat",
   "private": true,
   "type": "module",
   "devDependencies": {

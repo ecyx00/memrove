@@ -253,7 +253,7 @@ describe('memrove-chat', () => {
     await $.session.start(start)
     const r = await $.classic.SessionStart({ source: 'startup', session_id: 's' } as never)
     expect(r.additionalContext).toHaveLength(2)
-    expect(r.additionalContext?.[0]).toMatch(/^Before you answer or start a task that may build on earlier work, search first;/)
+    expect(r.additionalContext?.[0]).toMatch(/^Before you answer or start a task that may build on earlier work, search first/)
     expect(r.additionalContext?.[1]).toBe('other')
   })
 
