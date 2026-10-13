@@ -234,6 +234,8 @@ def main():
         state = args.state or cli.default_state(args.vault.resolve())
         if args.uninstall and not args.global_mode:
             raise ValueError("--uninstall works with --global only; remove the vault files by hand")
+        if args.global_mode and not args.uninstall and not args.plan:
+            install(args.vault, state, False, args.workspace_root)  # the global hook runs the vault's scripts, so install them first
         result = (install_global(args.vault, state, args.uninstall, plan_only=args.plan) if args.global_mode
                   else install(args.vault, state, args.plan, args.workspace_root))
         print(json.dumps(result))

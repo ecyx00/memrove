@@ -27,6 +27,13 @@ class InstallOptionsTest(unittest.TestCase):
         cfg = json.loads((self.state / "project-config.json").read_text())
         self.assertEqual(cfg["workspace_roots"], [str(work.resolve())])
 
+    def test_global_alone_installs_the_vault_and_workspace_root(self):
+        work = Path(self.tmp.name) / "work"
+        r = run(self.home, "--vault", str(self.vault), "--state", str(self.state), "--global", "--workspace-root", str(work))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.vault / ".claude/scripts/memrove_v3_hook.py").is_file())
+        self.assertEqual(json.loads((self.state / "project-config.json").read_text())["workspace_roots"], [str(work.resolve())])
+
     def test_doc_search_scans_no_repo_by_default(self):
         (self.home / "Desktop/proj/docs/state").mkdir(parents=True)
         code = "import sys; sys.path.insert(0, %r); import memrove_v3_docsearch as d; print(d.repos())" % str(ROOT / "template/.claude/scripts")
