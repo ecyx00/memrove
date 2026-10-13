@@ -336,6 +336,13 @@ def main():
         if not args.metadata_only:
             if event == "SessionStart":
                 notice = session_notice(state, payload) + health_warning(state)
+                if args.harness == "claude":
+                    try:  # standing rules are pushed text (a rule works by being in context)
+                        from memrove_v3_rules import block as rules_block
+                        from memrove_v3_project import project_name
+                        notice += rules_block(state, project_name(payload.get("cwd"), state, vault))
+                    except Exception:
+                        pass
             elif event == "UserPromptSubmit":
                 notice = pastref_line(payload, state)
         settings = read(vault)

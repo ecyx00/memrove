@@ -886,9 +886,9 @@ class OptOutAndSearch(Base):
         db.close()
         ids = lambda out: [l.split('|')[0] for l in out.splitlines()]
         out = cs.search(self.state, 'zebra cache', until='2026-10-08')
-        self.assertEqual(sorted(ids(out)), ['0', 'rec:obs-new'])           # hidden: replaced, later than T, dropped, auto-captured, private, expired
+        self.assertEqual(sorted(ids(out)), ['0', 'rec:obs-new', 'rec:q-auto'])  # hidden: replaced, later than T, dropped, private, expired; cue-captured (q-) records are returned
         self.assertIn('|decision|zebra cache is back', out)
-        self.assertEqual([i for i in ids(cs.search(self.state, 'zebra cache', until='2026-10-06T09:00')) if i.startswith('rec:')], ['rec:obs-old'])  # a datetime T excludes its own day; the successor is not yet valid
+        self.assertEqual([i for i in ids(cs.search(self.state, 'zebra cache', until='2026-10-06T09:00')) if i.startswith('rec:')], ['rec:obs-old', 'rec:q-auto'])  # a datetime T excludes its own day; the successor is not yet valid
         self.assertEqual(sorted(i for i in ids(cs.search(self.state, 'zebra cache')) if i.startswith('rec:')), ['rec:obs-late', 'rec:obs-new'])
 
 

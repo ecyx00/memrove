@@ -377,7 +377,7 @@ def entry(db, vault, project, limit=5000, decisions=6, old=3, state=None):
         if e["type"] == "supersedes" and not e["dst"].startswith(("concept:", "project:")):
             newer.setdefault(e["dst"], e["src"])
     order = lambda n: (n.get("ts") or n["day"], n["id"])  # full timestamp when the record has one; a date-only record sorts first within its day
-    decs = sorted((n for n in mine if n["kind"] == "decision"), key=order, reverse=True)
+    decs = sorted((n for n in mine if n["kind"] == "decision" and n.get("status") != "dropped_llm"), key=order, reverse=True)
     cur = [n for n in decs if n["id"] not in newer and n.get("status") != "superseded"]
     gone = [n for n in decs if n not in cur]
     out = [f"project {name}"]

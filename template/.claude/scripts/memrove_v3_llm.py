@@ -232,6 +232,9 @@ def _j1_batch(engine, vault, state, root, rows):
         changes = {"rule": _short(a["answers"]["rule_name"], 60)}
         row = next((r for r in rows if r["id"] == a["item_id"]), {})
         cut = a["state"] == "assessed" and a["answers"]["standing_rule"] == "no"
+        if cut and row.get("verified_by") == "user_quote":
+            from memrove_v3_capture import SELF  # the owner names its own subject ("her şey", "izin isteme"): the previous line cannot make it unclear
+            cut = not SELF.search(row.get("quote") or row.get("text", ""))
         _decide_kind(_short(row.get("quote") or row.get("text", ""), 200), "none" if cut else row.get("kind"), a["item_id"], "j1",
                      row.get("project"), row.get("session"), options=[row.get("kind"), "none"], standing_rule=a["answers"].get("standing_rule"))
         if cut:
@@ -794,6 +797,7 @@ def run_jobs(engine, vault, state, events, root=None):
     import memrove_v3_entities as entities
     try:
         for name, fn in (("j2", lambda: session_notes(engine, vault, state, events, root)), ("j1", lambda: judge_quotes(engine, vault, state, root)),
+                         ("restate", lambda: __import__("memrove_v3_restate").restate_rules(engine, vault, state, root)),  # one English sentence + scope per owner rule, for the pushed block
                          ("lessons", lambda: judge_lessons(engine, vault, state, root)),
                          ("reassess", lambda: reassess(engine, vault, state, root)),
                          ("j3", lambda: tag_docs(engine, vault, state, root)),

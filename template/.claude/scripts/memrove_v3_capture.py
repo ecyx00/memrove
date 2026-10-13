@@ -18,12 +18,20 @@ MAX_NEW = 200  # safety cap per run; sync is incremental now
 TAG = re.compile(r"<(system-reminder|task-notification|command-[a-z]+|local-command-[a-z]+)>.*?</\1>", re.S)
 # Cue regexes below mix Turkish and English: her zaman/asla/bundan sonra = always/never/from now on; yanlış/hayır/yapma/vazgeç/istemiyorum/olmaz = wrong/no/don't/give up/I don't want/no way; karar verdim/kararım/kullanalım/ile gidelim = I decided/my decision/let's use/let's go with; haberin olsun = for your information; tercih = preference. They match Turkish user text.
 GLOBAL = re.compile(r"\b(her zaman|asla|bundan sonra|hicbir zaman|hiçbir zaman|always|never|from now on)\b", re.I)
+# The owner's usual rule forms (olmalı/olmasın/kalmamalı, "yok artık", permission grants); checked first so a rule with a
+# task verb or a mild cue word is still a rule. Negative forms are rejections, the rest preferences.
+NEG_RULE = re.compile(r"\b(?:olmas[ıi]n|kalmas[ıi]n|kalmamal[ıi]|\w+m[ae]m[ae]l[ıi]|\w+m[ae](?:yacağ[ıi][mz]|yelim|yal[ıi]m)|izin\s+(?:isteme|verme)|yok\b.{0,12}\bartık|artık\b.{0,30}\byok\b|işimiz\s+yok|bağımız\s+yok|yasak|must not|should not)\b", re.I)
+POS_RULE = re.compile(r"\b(?:olmal[ıi]|izin\s+veriyorum|izin\s+verdim|demiştim|demistim|must|should always)\b", re.I)
+# a statement that names its own subject: J1 may not drop it for an unclear referent in the previous line
+SELF = re.compile(r"\b(?:her\s*şey|hiçbir\s*şey|hiç\s*bir\s*şey|her zaman|asla|everything|nothing|always|never|izin\s+isteme)\b", re.I)
 CUES = (
+    ("rejected", NEG_RULE),
+    ("preference", POS_RULE),
     ("rejected", re.compile(r"\b(yanlış|yanlis|hayır|hayir|yapma|vazgeç|vazgec|istemiyorum|olmaz|don'?t|do not|stop (?:using|doing)|not what i|instead of|revert)\b", re.I)),
     ("decision", re.compile(r"\b(karar verdim|kararım|karar:|kullanalım|ile gidelim|let'?s go with|we(?:'ll| will) use|i decided|decided to)\b", re.I)),
     ("preference", re.compile(r"\b(her zaman|asla|bundan sonra|tercih|always|never|from now on|i prefer|prefer to|istiyorum ki|olsun)\b", re.I)),
 )
-DURABLE = re.compile(r"\b(her zaman|asla|hep|bundan sonra|haberin olsun|karar verdim|kararım[ıi]z|karar:|always|never|from now on)\b", re.I)
+DURABLE = re.compile(r"\b(\w+m[ae]m[ae]l[ıi]|\w+m[ae](?:yacağ[ıi][mz]|yelim|yal[ıi]m)|olmal[ıi]|olmas[ıi]n|kalmamal[ıi]|kalmas[ıi]n|olmamal[ıi]|izin\s+isteme|izin\s+veriyorum|demiştim|yok\b.{0,12}\bartık|işimiz\s+yok|bağımız\s+yok|her zaman|asla|hep|bundan sonra|haberin olsun|karar verdim|kararım[ıi]z|karar:|always|never|from now on)\b", re.I)
 # ponytail: surface heuristics (Turkish suffix regexes), tuned on the 15-quote audit; revisit at >=50 real quotes
 R1 = re.compile(r"^(?:(?:bu|şu|o)\s+\w+(?:sa|se)\b|(?:bunu|şunu|onu)\b)", re.I)  # deictic with unresolved referent
 R2 = re.compile(r"\b(?:\w+(?:alım|elim)|hallet|yap|bak)\b", re.I)  # 1st-plural / imperative task directive
@@ -45,6 +53,23 @@ def user_text(rec):
         return None
     c = TAG.sub("", c).strip()
     return None if not c or c.startswith(("<", "[Request interrupted", "Caveat:")) else c
+
+
+def assistant_text(rec):
+    if rec.get("type") != "assistant":
+        return None
+    c = (rec.get("message") or {}).get("content")
+    if isinstance(c, list):
+        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return " ".join(c.split()) if isinstance(c, str) and c.strip() else None
+
+
+def context_window(owners, assistant, message="", cwd=""):
+    """The text the restate step reads with a quote: the owner's whole message that holds it, the owner's last 3 lines before it, the
+    assistant's last message and the session's directory (secrets -> '')."""
+    parts = (["cwd: " + cwd[:120]] if cwd else []) + (["message: " + message[:500]] if message else []) + ["owner: " + o[:160] for o in owners[-3:]] + (["assistant: " + assistant[:240]] if assistant else [])
+    ctx = " | ".join(parts)
+    return "" if has_secret(ctx) else ctx[:1100]
 
 
 def sentences(text):
@@ -234,22 +259,24 @@ def run(engine, event):
         return 0  # Stop is throttled; cursor stays so the next trigger sees these turns
     count_used(engine, sid, recs)
     cwd, project = event.get("cwd") or ".", event.get("project") or "unknown"
-    tasks, files, quotes, prev = cur.get("tasks", {}), [], [], ""
+    tasks, files, quotes, prev, owners, last_a = cur.get("tasks", {}), [], [], "", [], ""
     for r in recs:
         apply_tasks(r, tasks)
         files.extend(p for p in touched(r, cwd) if p not in files)
+        last_a = assistant_text(r) or last_a
         t = user_text(r)
         if t:
-            quotes.extend((typ, q, prev) for typ, q in capture(t))
+            quotes.extend((typ, q, prev, context_window(owners, last_a, " ".join(t.split()), cwd)) for typ, q in capture(t))
             prev = t
+            owners.append(" ".join(t.split()))
     written = 0
     today = date.today().isoformat()
     base = {"project": project, "session": sid, "verified_by": "user_quote", "status": "active", "origin_type": "user_explicit", "confidence": 1.0,
             "extractor_version": EXTRACTOR_VERSION, "valid_from": today}
     firsts = {}
-    for typ, quote, p in quotes:
-        firsts.setdefault((typ, quote), p)
-    for (typ, quote), p in list(firsts.items())[:MAX_NEW]:
+    for typ, quote, p, ctx in quotes:
+        firsts.setdefault((typ, quote), (p, ctx))
+    for (typ, quote), (p, ctx) in list(firsts.items())[:MAX_NEW]:
         rid = "q-" + _sha(project + typ + quote, 16)
         meta = dict(base, id=rid, kind=typ, key=key_of(quote), polarity="neg" if typ == "rejected" else "pos")
         old = opposed(engine, project, meta["key"], meta["polarity"], rid, quote)
@@ -259,6 +286,8 @@ def run(engine, event):
             meta["durable"] = True
         if p and not has_secret(p):
             meta["prev"] = " ".join(p.split())[:200]  # J1 judges a quote with the line before it
+        if ctx:
+            meta["ctx"] = ctx  # the restate step reads the wider window, not only the line before
         try:
             engine.note_create(f"notes/captured/{rid}.md", quote, meta)
             written += 1

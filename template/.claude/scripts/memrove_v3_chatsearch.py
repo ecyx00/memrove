@@ -34,8 +34,9 @@ FOLD = str.maketrans({"ı": "i", "İ": "i", "I": "i"})
 WORD = re.compile(r"\w+", re.UNICODE)
 HYPHENATED = re.compile(r"\w+(?:[-_]\w+)+", re.UNICODE)
 REC_KINDS = ("decision", "rejected", "lesson", "preference", "note")
-REC_SOURCE = "notes/observed/"   # where `memrove remember` writes; auto-captured records live under notes/captured, notes/inferred, ...
+REC_SOURCES = ("notes/observed/", "notes/captured/", "notes/inferred/")   # `memrove remember` (obs-), cue capture (q-), J2 (p-)
 REC_WEIGHT = 2.5   # a record's bm25 is scaled up: the few hundred records give every term a lower idf than the thousands of messages do
+OTHER = 0.6      # score factor of a q-/p- record against an obs- one
 REC_SLOTS = 2      # records in one answer at most, so a hub of records cannot push the messages out
 REC_OFF = frozenset(("retired", "rejected", "dropped_llm", "deleted_by_user", "source_missing"))
 
@@ -210,14 +211,15 @@ def records(state, query, top=TOP, since=None, until=None, session_notes=False):
     now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() if not until else (until if len(until) > 10 else until + "T23:59:59")
     marks = ",".join("?" * len(REC_KINDS))
     j = lambda k: f"coalesce(json_extract(payload,'$.{k}'),'')"
+    src = " OR ".join(j("source") + " LIKE ?" for _ in REC_SOURCES)
     try:
         db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
         rows = db.execute(
             f"SELECT id, payload, {j('kind')}, {j('project')}, {j('scope')} FROM records WHERE {j('kind')} IN ({marks}) "
-            f"AND ({j('source')} LIKE ? {'OR ' + j('source') + ' LIKE ' + repr('notes/sessions/%') if session_notes else ''}) "
+            f"AND (({src}) {'OR ' + j('source') + ' LIKE ' + repr('notes/sessions/%') if session_notes else ''}) "
             f"AND {j('status')} NOT IN ({','.join(repr(s) for s in sorted(REC_OFF))}) AND {j('verdict')}!='reject' AND {j('visibility')}!='private' "
             f"AND ({j('imported_from')} NOT LIKE '%-session' OR json_extract(payload,'$.assessments.j1.answers.durable')='yes')",
-            (*REC_KINDS, REC_SOURCE + "%")).fetchall()
+            (*REC_KINDS, *(x + "%" for x in REC_SOURCES))).fetchall()
         db.close()
     except sqlite3.Error:
         return []
@@ -250,6 +252,9 @@ def records(state, query, top=TOP, since=None, until=None, session_notes=False):
         for i, b in mem.execute("SELECT rowid, bm25(fts) FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?", (expr, CAND)):
             score[i] = score.get(i, 0.0) + weight * b
     mem.close()
+    for i in score:   # bm25 is negative, lower is better: a cue-captured (q-) or inferred (p-) record ranks behind a saved (obs-) one
+        if not str(live[i][1].get("source") or "").startswith(REC_SOURCES[0]):
+            score[i] *= OTHER
     out = []
     for i in sorted(score, key=score.get)[:top]:
         rid, r, when = live[i]

@@ -25,6 +25,22 @@ def _context(event, text):
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
 
 
+def _rules(payload):
+    """The global standing rules (short form) for a subagent; '' when off or on any error. State: MEMROVE_STATE, else the newest memrove-v3 store."""
+    try:
+        import os
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from memrove_v3_rules import block
+        state = os.environ.get("MEMROVE_STATE")
+        if not state:
+            base = Path.home() / "Library/Application Support/memrove-v3" if sys.platform == "darwin" else Path.home() / ".local/share/memrove-v3"
+            found = sorted(base.glob("*/memory.sqlite3"), key=lambda p: p.stat().st_mtime)
+            state = found[-1].parent if found else None
+        return ("\n" + block(state, global_only=True)) if state else ""
+    except Exception:
+        return ""
+
+
 def handle(payload, state=None):
     """The hook output dict for one payload, or None for no injection. Never a deny."""
     if not isinstance(payload, dict):
@@ -32,7 +48,7 @@ def handle(payload, state=None):
     event = payload.get("hook_event_name")
     if event == "SubagentStart":
         kind = str(payload.get("agent_type") or "").rsplit(":", 1)[-1]  # plugin agents arrive as plugin:name
-        return _context(event, SUBAGENT_RULE) if kind in SUBAGENT_TYPES else None
+        return _context(event, SUBAGENT_RULE + _rules(payload)) if kind in SUBAGENT_TYPES else None
     if event == "SessionStart":
         return _context(event, RULE) if payload.get("source") in RESUME_SOURCES else None
     if event == "PreToolUse" and payload.get("tool_name") == "AskUserQuestion":
