@@ -116,6 +116,14 @@ class RulesTest(unittest.TestCase):
         self.assertEqual([ln for ln in b.splitlines()[1:]], ["- The owner wants commits in English."])
         self.assertEqual(rules.block(store([])), "")
 
+    def test_a_correction_hides_the_old_rule_before_it_is_restated(self):
+        d = store([
+            rec("q-old", "preference", "x", "2026-10-12", assessments=judged("The assistant must write everything in English.")),
+            rec("obs-new", "preference", "Everything is English, but replies to the user are in their language.", "2026-10-13", supersedes=["q-old"],
+                source="notes/observed/preference/new.md"),
+        ])
+        self.assertNotIn("The assistant must write everything in English.", rules.block(d, "demo"))
+
     def test_project_rule_only_in_its_project_and_never_cut(self):
         d = store([rec("q-1", "rejected", "sidebar istemiyorum", "2026-10-07", project=".claude",
                        assessments=judged("In Acme, the mode indicators do not sit in a sidebar.", "project", "Acme")),

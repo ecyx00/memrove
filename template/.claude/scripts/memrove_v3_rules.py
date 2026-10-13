@@ -73,9 +73,9 @@ def rules(state, project=None, global_only=False):
         while root in dup and hops < 20:
             root, hops = dup[root], hops + 1
         said[root] = said.get(root, 0) + 1
+    gone = {s for r in rows if _live(r) for s in (r.get("supersedes") or [])}   # a correction hides the old rule even before it is restated itself
     rows = [(r, _restated(r)) for r in rows if _own(r) and _live(r)]
     rows = [(r, x) for r, x in rows if x]
-    gone = {s for r, _ in rows for s in (r.get("supersedes") or [])}
     # global: scope global; a project rule only for a session of that project (never in the subagent form)
     mine = [(r, x) for r, x in rows if r["id"] not in gone and (x[1] == "global" or (not global_only and project and _norm(x[2]) == _norm(project)))]
     # project rules and global rules take turns, each list ordered by how often the owner said the rule, then newest first:
