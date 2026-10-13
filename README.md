@@ -54,6 +54,8 @@ python3 /path/to/vault/memrove.py doctor                        # check
 
 Open the vault folder in a new Claude Code or Codex session. In Codex, review and trust the new hooks with `/hooks`. For the `zoom`, `date` and `project` model tools in Claude Code, load the plugin in `mods/memrove-chat` (`claude --plugin-dir mods/memrove-chat`); its options are in `mods/memrove-chat/README.md`. Update with `memrove.py update`, undo with `memrove.py rollback`. The engine needs no accounts, API keys or servers. `install_v3.py` backs up what it touches and writes no global settings unless `--global` is given.
 
+Installer options: `--python EXE` picks the interpreter baked into the hooks and the `memrove` wrapper (the installer warns when the running python looks like conda or a venv, which breaks when that environment goes away); `--workspace-root DIR` (repeatable) lists a folder whose direct subfolders are separate projects, for one big vault of many apps, even when the folder holds a `CLAUDE.md` or subfolders hold their own markers. Keep memrove's own vault outside that folder: a session inside memrove's vault resolves to no project.
+
 Doc search (`memrove search` doc handles) reads write-ups under `<repo>/docs/{state,design,research,decisions}` of the repos named in `MEMROVE_DOC_REPOS` (a `:`-separated list of repo directories) and of nothing else by default.
 
 ### Viewing the graph

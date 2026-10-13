@@ -20,6 +20,18 @@ GLOBAL_EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop", "Sess
 JIT_EVENTS = (("SubagentStart", None), ("PreToolUse", "AskUserQuestion"), ("PostToolUse", "Write|Edit|MultiEdit"))
 SKILLS = ("memrove", "memrove-doctor")
 WRAPPER_MARK = "# memrove-v3 global wrapper"
+PYTHON = sys.executable  # baked into hook commands and the wrapper; --python overrides
+
+
+def python_warning(path):
+    """A note when `path` looks like a conda or venv interpreter (it vanishes with the environment, and hooks then fail silently)."""
+    p = Path(path)
+    low = str(p).lower()
+    if any(w in low for w in ("conda", "miniforge", "mambaforge", "venv", "virtualenv", "/envs/")) or (p.parent.parent / "pyvenv.cfg").exists():
+        return f"warning: {path} looks like a conda or venv python; hooks break if that environment goes away. Use --python with a system python (for example /opt/homebrew/bin/python3)."
+    return None
+
+
 VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").is_file() else "3.0.0"
 
 BLOCK = f"""{START}
@@ -109,7 +121,7 @@ def plan(vault, state):
         files[f".agents/skills/{name}/SKILL.md"] = files[f".claude/skills/{name}/SKILL.md"] = body
     hook = vault / ".claude/scripts/memrove_v3_hook.py"
     for harness, name in (("claude", ".claude/settings.local.json"), ("codex", ".codex/hooks.json")):
-        cmd = shlex.join([sys.executable, str(hook), "--vault", str(vault), "--state", str(state), "--harness", harness])
+        cmd = shlex.join([PYTHON, str(hook), "--vault", str(vault), "--state", str(state), "--harness", harness])
         files[name] = js(with_hooks(vault / name, cmd, EVENTS))
     cfg = vault / ".codex/config.toml"
     files[".codex/config.toml"] = codex_config(cfg.read_text(encoding="utf-8") if cfg.exists() else "").encode()
@@ -165,7 +177,7 @@ def install_wrapper(vault, state, uninstall=False, bin_dir=None):
     q = shlex.quote
     write(path, f"""#!/bin/sh
 {WRAPPER_MARK}
-exec {q(sys.executable)} {q(str(ROOT / "scripts/memrove_v3.py"))} --vault {q(str(Path(vault).resolve()))} --state {q(str(state))} "$@"
+exec {q(PYTHON)} {q(str(ROOT / "scripts/memrove_v3.py"))} --vault {q(str(Path(vault).resolve()))} --state {q(str(state))} "$@"
 """.encode())
     path.chmod(0o755)
     return str(path)
@@ -176,9 +188,9 @@ def install_global(vault, state, uninstall=False, settings=None, plan_only=False
     path = Path(settings) if settings else Path.home() / ".claude/settings.json"
     raw = path.read_bytes() if path.exists() else None
     hook = Path(vault).resolve() / ".claude/scripts/memrove_v3_hook.py"
-    cmd = None if uninstall else shlex.join([sys.executable, str(hook), "--vault", str(Path(vault).resolve()),
+    cmd = None if uninstall else shlex.join([PYTHON, str(hook), "--vault", str(Path(vault).resolve()),
                                              "--state", str(state), "--harness", "claude", "--global"])
-    jit = shlex.join([sys.executable, str(hook.with_name("memrove_v3_jit.py")), "--state", str(state)])
+    jit = shlex.join([PYTHON, str(hook.with_name("memrove_v3_jit.py")), "--state", str(state)])
     new = js(with_hooks(path, cmd, GLOBAL_EVENTS, {"UserPromptSubmit": 2}, jit))
     out = {"settings": str(path), "status": "plan" if plan_only else "unchanged" if new == raw else
            "uninstalled" if uninstall else "installed"}
@@ -204,7 +216,16 @@ def main():
     ap.add_argument("--uninstall", action="store_true", help="with --global: remove the hook and the wrapper")
     ap.add_argument("--workspace-root", action="append", default=[], metavar="DIR",
                     help="a folder whose direct subfolders are separate projects (e.g. a work vault root); repeatable; written to <state>/project-config.json")
+    ap.add_argument("--python", metavar="EXE", help="interpreter baked into hook commands and the wrapper (default: the one running this script)")
     args = ap.parse_args()
+    global PYTHON
+    if args.python:
+        if not os.access(args.python, os.X_OK):
+            ap.error(f"--python {args.python} is not an executable file")
+        PYTHON = os.path.abspath(args.python)  # not resolved: a symlink such as /opt/homebrew/bin/python3 survives upgrades
+    note = python_warning(PYTHON)
+    if note:
+        print(note, file=sys.stderr)
     spec = importlib.util.spec_from_file_location("memrove_cli_defaults", ROOT / "scripts/memrove_v3.py")
     cli = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cli)

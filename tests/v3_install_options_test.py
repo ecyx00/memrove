@@ -34,6 +34,15 @@ class InstallOptionsTest(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], env=dict(env, HOME=str(self.home)), capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), "[]", r.stderr)
 
+    def test_python_option_is_baked_and_conda_python_warns(self):
+        fake = Path(self.tmp.name) / "anaconda3/bin/python3"
+        fake.parent.mkdir(parents=True)
+        fake.symlink_to(sys.executable)
+        r = run(self.home, "--vault", str(self.vault), "--state", str(self.state), "--python", str(fake))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("conda or venv", r.stderr)
+        self.assertIn(str(fake), (self.vault / ".claude/settings.local.json").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
