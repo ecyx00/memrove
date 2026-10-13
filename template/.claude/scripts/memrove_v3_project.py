@@ -12,20 +12,24 @@ MARKERS = (".git", ".memrove", "pyproject.toml", "package.json", "Cargo.toml", "
 WORKSPACES = ("Desktop", "Projects", "Developer", "code", "src")  # under home; state/project-config.json {"workspace_roots": [...]} adds more
 
 
-def workspace_roots(state=None):
-    home = Path.home().resolve()
-    roots = {home / w for w in WORKSPACES}
+def configured_roots(state=None):
+    """Workspace roots the owner listed in state/project-config.json (installer: --workspace-root)."""
     try:
         extra = json.loads((Path(state) / "project-config.json").read_text(encoding="utf-8")).get("workspace_roots", []) if state else []
     except (OSError, ValueError, AttributeError):
         extra = []
-    roots |= {Path(x).expanduser().resolve() for x in extra if isinstance(x, str) and x}
-    return roots
+    return {Path(x).expanduser().resolve() for x in extra if isinstance(x, str) and x}
+
+
+def workspace_roots(state=None):
+    home = Path.home().resolve()
+    return {home / w for w in WORKSPACES} | configured_roots(state)
 
 
 def resolve(cwd, state=None, vault=None):
     """-> (name, root): the nearest git root / marker directory above cwd; failing that, the ancestor that is a direct child of a
     workspace root (~/Desktop, ~/Projects, ... plus state/project-config.json). Else (None, None).
+    A direct child of a root listed in project-config.json is the project even when a marker sits deeper (checked first).
     Home, `/`, workspace roots themselves and the vault (and anything inside it) are never projects."""
     start = Path(cwd or ".").expanduser().resolve()
     home = Path.home().resolve()
@@ -34,6 +38,10 @@ def resolve(cwd, state=None, vault=None):
         return None, None
     roots = workspace_roots(state)
     chain = [p for p in (start, *start.parents)]
+    strict = configured_roots(state)  # a configured root's direct child is the project, whatever markers sit deeper (one vault, many subfolders)
+    for p in chain:
+        if p.parent in strict and p != vault and p != home:
+            return p.name, p
     for p in chain:
         if p == home or p == p.parent:
             break

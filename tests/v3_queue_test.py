@@ -163,6 +163,18 @@ class StickyProjectTest(unittest.TestCase):
         (self.state / 'project-config.json').write_text(json.dumps({'workspace_roots': [str(ws)]}))
         self.assertEqual(project.project_name(ws / 'proj' / 'sub', self.state), 'proj')
 
+    def test_configured_root_child_beats_deeper_markers_and_root_marker(self):
+        ws = self.home / 'work'
+        (ws / 'a' / 'deeper').mkdir(parents=True)
+        (ws / 'b').mkdir()
+        (ws / 'CLAUDE.md').write_text('map')
+        (ws / 'a' / 'deeper' / 'package.json').write_text('{}')
+        self.state.mkdir(exist_ok=True)
+        (self.state / 'project-config.json').write_text(json.dumps({'workspace_roots': [str(ws)]}))
+        self.assertEqual(project.project_name(ws / 'a' / 'deeper', self.state), 'a')
+        self.assertEqual(project.project_name(ws / 'b', self.state), 'b')
+        self.assertEqual(project.resolve(ws, self.state), (None, None))
+
     def tool_transcript(self, paths, cds=()):
         tp = self.home / 'tool.jsonl'
         lines = [base.line(type='assistant', message={'content': [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': p}}]}) for p in paths]

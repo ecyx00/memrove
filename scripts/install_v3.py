@@ -123,7 +123,16 @@ def plan(vault, state):
     return files
 
 
-def install(vault, state, plan_only=False):
+def add_workspace_roots(state, roots):
+    """Merge `roots` into state/project-config.json workspace_roots: a direct child of a listed root is a project (markers at the root itself never count)."""
+    path = Path(state) / "project-config.json"
+    cfg = load_json(path)
+    have = [r for r in cfg.get("workspace_roots", []) if isinstance(r, str)]
+    cfg["workspace_roots"] = have + [r for r in (str(Path(x).expanduser().resolve()) for x in roots) if r not in have]
+    write(path, js(cfg))
+
+
+def install(vault, state, plan_only=False, workspace_roots=()):
     vault, state = Path(vault).resolve(), Path(state).resolve()
     if not vault.is_dir() or state == vault or vault in state.parents:
         raise ValueError("an existing vault and a state directory outside it are required")
@@ -135,6 +144,8 @@ def install(vault, state, plan_only=False):
         path = vault / name
         if not (path.exists() and path.read_bytes() == data):
             write(path, data)
+    if workspace_roots:
+        add_workspace_roots(state, workspace_roots)
     write(state / "v3-install.json", js({"version": VERSION, "files": sorted(files)}))
     sys.path.insert(0, str(SCRIPTS))
     from memrove_v3_companion import initialize
@@ -191,6 +202,8 @@ def main():
     ap.add_argument("--plan", action="store_true", help="report what would change; write nothing")
     ap.add_argument("--global", dest="global_mode", action="store_true", help="wire the hook into ~/.claude/settings.json")
     ap.add_argument("--uninstall", action="store_true", help="with --global: remove the hook and the wrapper")
+    ap.add_argument("--workspace-root", action="append", default=[], metavar="DIR",
+                    help="a folder whose direct subfolders are separate projects (e.g. a work vault root); repeatable; written to <state>/project-config.json")
     args = ap.parse_args()
     spec = importlib.util.spec_from_file_location("memrove_cli_defaults", ROOT / "scripts/memrove_v3.py")
     cli = importlib.util.module_from_spec(spec)
@@ -201,7 +214,7 @@ def main():
         if args.uninstall and not args.global_mode:
             raise ValueError("--uninstall works with --global only; remove the vault files by hand")
         result = (install_global(args.vault, state, args.uninstall, plan_only=args.plan) if args.global_mode
-                  else install(args.vault, state, args.plan))
+                  else install(args.vault, state, args.plan, args.workspace_root))
         print(json.dumps(result))
         return 0
     except Exception as exc:
