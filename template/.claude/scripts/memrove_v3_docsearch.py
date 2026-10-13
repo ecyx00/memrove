@@ -13,7 +13,7 @@ import memrove_v3_chatlog as chatlog
 import memrove_v3_chatsearch as cs
 
 SUBDIRS = ("state", "design", "research", "decisions")
-ROOTS_ENV = "MEMROVE_DOC_REPOS"   # os.pathsep-separated repo dirs; default: ~/Desktop/* and the memrove source checkout
+ROOTS_ENV = "MEMROVE_DOC_REPOS"   # os.pathsep-separated repo dirs; default: none
 SLOTS = 3
 MAX_BYTES = 400_000
 HEAD = re.compile(r"^#{1,4}\s+(.*)$")
@@ -23,8 +23,7 @@ DAY = re.compile(r"(\d{4}-\d{2}-\d{2})")
 def repos():
     if os.environ.get(ROOTS_ENV):
         return [Path(p) for p in os.environ[ROOTS_ENV].split(os.pathsep) if p]
-    home = Path.home()
-    return sorted(p for p in (home / "Desktop").glob("*") if p.is_dir()) + [home / ".local/share/memrove/src"]
+    return []  # nothing beyond the vault until the owner names repos
 
 
 def files():

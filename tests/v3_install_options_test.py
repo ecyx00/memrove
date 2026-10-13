@@ -27,6 +27,13 @@ class InstallOptionsTest(unittest.TestCase):
         cfg = json.loads((self.state / "project-config.json").read_text())
         self.assertEqual(cfg["workspace_roots"], [str(work.resolve())])
 
+    def test_doc_search_scans_no_repo_by_default(self):
+        (self.home / "Desktop/proj/docs/state").mkdir(parents=True)
+        code = "import sys; sys.path.insert(0, %r); import memrove_v3_docsearch as d; print(d.repos())" % str(ROOT / "template/.claude/scripts")
+        env = {k: v for k, v in os.environ.items() if k != "MEMROVE_DOC_REPOS"}
+        r = subprocess.run([sys.executable, "-c", code], env=dict(env, HOME=str(self.home)), capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "[]", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
