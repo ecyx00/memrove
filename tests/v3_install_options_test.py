@@ -43,6 +43,12 @@ class InstallOptionsTest(unittest.TestCase):
         self.assertIn("conda or venv", r.stderr)
         self.assertIn(str(fake), (self.vault / ".claude/settings.local.json").read_text())
 
+    def test_readme_names_only_real_commands(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import re, memrove_v3
+        for name in re.findall(r"`memrove(?:\.py)? (\w[\w-]*)", (ROOT / "README.md").read_text()):
+            self.assertIn(name, memrove_v3.COMMANDS, name)
+
 
 if __name__ == "__main__":
     unittest.main()
