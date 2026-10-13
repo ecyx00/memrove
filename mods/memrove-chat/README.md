@@ -25,4 +25,11 @@ claude plugin test .
 claude --plugin-dir . 
 ```
 
+Install from the directory marketplace in this repo (`mods/.claude-plugin/marketplace.json`, checked with `claude plugin validate mods`):
+
+```sh
+claude plugin marketplace add /path/to/memrove/mods
+claude plugin install memrove-chat@memrove-mods
+```
+
 Types come from `/plugin-types` (`.claude-plugin/types/`, git-ignored).
