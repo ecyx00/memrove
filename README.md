@@ -23,7 +23,6 @@ Memory graph of a real install, labels removed. Nodes are notes, edges are `[[li
 ![The memrove Grab panel with demo text, and the saved card](docs/grab.png)
 
 - **Hooks.** Hook scripts for Claude Code and Codex ingest sessions, add a short past-reference hint, and keep the index fresh. Hermes, OpenCode and OMP adapters are in `template/.claude/scripts/`.
-- **Grab.** A macOS panel (Swift source shipped with the installer) captures a page, a selection or a note with one key into the wiki sources. Commands: `memrove grab add|process|install`.
 - **Writer heartbeat.** Each background writer (chat compactor, session cards, threads) writes `<state>/heartbeat/<writer>.json` after every run. `memrove doctor` reports a chat-driven writer with no heartbeat 24 hours after first use, so a silent writer does not go unnoticed.
 
 ## Architecture
