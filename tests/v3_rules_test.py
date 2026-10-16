@@ -124,6 +124,15 @@ class RulesTest(unittest.TestCase):
         ])
         self.assertNotIn("The assistant must write everything in English.", rules.block(d, "demo"))
 
+    def test_a_correction_marked_as_duplicate_of_the_old_rule_still_replaces_it(self):
+        d = store([
+            rec("q-old", "preference", "x", "2026-10-12", assessments=judged("The assistant must write everything in English.")),
+            rec("obs-new", "preference", "x", "2026-10-13", supersedes=["q-old"], restate_dup_of="q-old",
+                assessments=judged("The assistant writes files in English but replies to the user in their language.")),
+        ])
+        self.assertEqual(rules.block(d, "demo").splitlines()[1:],
+                         ["- The assistant writes files in English but replies to the user in their language."])
+
     def test_project_rule_only_in_its_project_and_never_cut(self):
         d = store([rec("q-1", "rejected", "sidebar istemiyorum", "2026-10-07", project=".claude",
                        assessments=judged("In Acme, the mode indicators do not sit in a sidebar.", "project", "Acme")),

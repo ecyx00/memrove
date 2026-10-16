@@ -66,6 +66,9 @@ def rules(state, project=None, global_only=False):
             "SELECT payload FROM records WHERE json_extract(payload,'$.kind') IN (?,?,?)", KINDS)]
     finally:
         db.close()
+    for r in rows:   # a correction is never a duplicate of the rule it replaces, even when the merge step marked it so
+        if r.get("restate_dup_of") in (r.get("supersedes") or []):
+            r["restate_dup_of"] = None
     dup = {r["id"]: r["restate_dup_of"] for r in rows if r.get("restate_dup_of")}
     said = {}   # how often the owner said a rule: the records merged into it, followed to the root
     for i in dup:
