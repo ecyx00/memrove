@@ -58,6 +58,18 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((result["status"], result["indexed"]), ("degraded", 1))
         self.assertEqual(result["warnings"][0]["source"], "notes/bad.md")
 
+    def test_yaml_page_with_block_scalar_and_flow_map_is_indexed(self):
+        (self.vault / "notes").mkdir(exist_ok=True)
+        (self.vault / "notes/y.md").write_text('---\ntitle: Hibrit: arama\nroots: {"a": "/b"}\nnote: |\n  one\n  two\n---\nbody\n', encoding="utf-8")
+        result = self.engine.sync()
+        self.assertEqual((result["status"], result["indexed"], result["warnings"]), ("succeeded", 1, []))
+
+    def test_snap_folder_is_skipped(self):
+        self.put("wiki/_sources/snap/x/README.md")
+        self.put("wiki/_concepts/c.md")
+        self.assertEqual(self.engine.sync()["indexed"], 1)
+        self.assertIsNone(self.record("README"))
+
     def test_duplicate_ids_are_quarantined(self):
         self.put("notes/x.md", id="same")
         self.put("notes/y.md", id="same")
@@ -68,8 +80,10 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(parse('---\n{"a": 1}\n---\nbody')[0], {"a": 1})
         meta, body = parse("---\ntitle: Plan\ntags: [x, y]\nfacts:\n  owner: me\n---\ntext\n")
         self.assertEqual((meta["title"], meta["tags"], meta["facts"], body), ("Plan", ["x", "y"], {"owner": "me"}, "text\n"))
+        meta = parse('---\ntitle: A: b\nroots: {"x": "/y"}\nnote: |\n  one\n  two\n\nnext: >\n  a\n  b\n---\n')[0]
+        self.assertEqual((meta["roots"], meta["note"], meta["next"]), ({"x": "/y"}, "one\ntwo\n", "a b\n"))
         with self.assertRaises(ValueError):
-            parse("---\nkey: |\n  block\n---\n")
+            parse("---\nkey: {oops\n---\n")
         self.assertEqual(parse("no front matter"), ({}, "no front matter"))
 
     def test_note_create_refuses_overwrite_and_bad_paths(self):

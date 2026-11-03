@@ -2,6 +2,7 @@
 """Past-reference trigger (flag-gated hook line) and the re-brief detector, on synthetic data."""
 # Note: the Turkish strings in this file are deliberate test inputs for the Turkish-text detectors (cues, stemming, case folding).
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,8 @@ sys.path.insert(0, str(SCRIPTS))
 import memrove_v3_chatlog as chatlog  # noqa: E402
 import memrove_v3_hook as hook  # noqa: E402
 import memrove_v3_pastref as pr  # noqa: E402
+
+os.environ["MEMROVE_DOC_REPOS"] = ""   # the line alone; pointers have their own test
 
 
 class TriggerTest(unittest.TestCase):
@@ -65,6 +68,40 @@ class RebriefTest(unittest.TestCase):
             pairs = [json.loads(l) for l in out.read_text().splitlines()]
         self.assertEqual([(p["new"], p["earlier"]) for p in pairs], [(3, 0)])
         self.assertEqual(res["weekly"]["2026-W42"][1], 1)
+
+    def test_in_session_corrections(self):
+        ask = "chatsearch passage index için bm25 sıralaması ekle ve zoom ile doğrula lütfen"
+        rows = [
+            ("kök nedeni bulup düzeltir misin lütfen bu testi", "2026-10-05T10:00:00+03:00", "c:A"),
+            ("hayır yanlış anladın, ben kategori filtresini istemiştim", "2026-10-05T10:02:00+03:00", "c:B"),  # marker
+            ("Here is a note offered by a side agent: hayır yanlış, demiştim ben sana", "2026-10-05T10:03:00+03:00", "c:C"),  # not the owner
+            ("[Subagent hand-back] yanlış sonuç, hayır", "2026-10-05T10:03:30+03:00", "c:C2"),
+            (ask, "2026-10-05T10:04:00+03:00", "c:D"),
+            (ask, "2026-10-05T10:06:00+03:00", "c:E"),  # same-session near-repeat
+            (ask, "2026-10-05T14:00:00+03:00", "c:F"),  # other session: old pairs, not an in-session correction
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            chatlog.append(d, [{"kind": "user", "text": t, "date": dt, "src": "claude", "k": k} for t, dt, k in rows], today="2026-10-05")
+            out = Path(d) / "pairs.jsonl"
+            res = json.loads(pr.rebrief_command(d, str(out)))
+            sample = [json.loads(l) for l in Path(res["corrections_file"]).read_text().splitlines()]
+            new = [json.loads(l)["new"] for l in out.read_text().splitlines()]
+        self.assertEqual({(r["how"], r["text"][:5]) for r in sample}, {("marker", "hayır"), ("repeat", ask[:5])})
+        self.assertEqual(res["corrections"], 2)
+        self.assertEqual(res["corrections_weekly"]["2026-W41"], [5, 1, 0.2, 1])
+        self.assertEqual(new, [6])  # old cross-session pair kept
+
+    def test_owner_prompt_filters_and_markers(self):
+        self.assertTrue(pr.is_correction("again? why"))
+        self.assertFalse(pr.is_correction("run it again please"))
+        self.assertFalse(pr.is_correction("try again later"))
+        rows = ["wrong file, bunu düzelt lütfen şimdi", "System One modelini kontrol et lütfen", "hook çalışmıyor neden, bakar mısın",
+                "nonce kontrolü nasıl çalışıyor anlat", "/Users/ann/x.md bunu oku lütfen", "/clear", "/model opus lütfen", "[System note] hello there"]
+        with tempfile.TemporaryDirectory() as d:
+            chatlog.append(d, [{"kind": "user", "text": t, "date": "2026-10-05T10:0%d:00+03:00" % n, "src": "claude", "k": "c:%d" % n} for n, t in enumerate(rows)], today="2026-10-05")
+            got = pr.owner_prompts(d)
+        self.assertEqual([x[3][:6] for x in got], ["wrong ", "System", "hook ç", "nonce ", "/Users"])
+        self.assertEqual(pr.corrections(got), {})  # the session-opening "wrong file" is not counted
 
     def test_probe_sessions_are_not_rebriefs(self):
         ask = "reply with only your exact model id and nothing else please now"

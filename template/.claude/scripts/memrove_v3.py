@@ -18,6 +18,8 @@ KEEP_REVISIONS = 5  # full snapshots kept per record in `events`; older ones shr
 HIDDEN_STATUS = ("untrusted", "dropped_llm", "deleted_by_user", "source_missing")
 
 
+BUSY_TIMEOUT = 30  # seconds a writer waits for the SQLite write lock; callers that matter retry on top (memrove_v3_context.remember)
+
 class RevisionConflict(ValueError):  # a record id already exists with other content
     pass
 
@@ -118,6 +120,11 @@ TABLES = (
     "CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, "
     "record_id TEXT NOT NULL, revision INTEGER NOT NULL, record TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS events_record_sequence ON events (record_id, sequence)",
+    # expression indexes for the json_extract lookups on every sync/capture/extract path; without them each is a scan of all payloads.
+    # The coalesce(type,kind) form must match memrove_v3_links._TYPE text for text, or SQLite will not use it.
+    "CREATE INDEX IF NOT EXISTS records_source ON records (json_extract(payload,'$.source'))",
+    "CREATE INDEX IF NOT EXISTS records_type_key ON records (coalesce(json_extract(payload,'$.type'),json_extract(payload,'$.kind')), json_extract(payload,'$.key'))",
+    "CREATE INDEX IF NOT EXISTS records_project_kind ON records (json_extract(payload,'$.project'), json_extract(payload,'$.kind'))",
 )
 
 
@@ -167,7 +174,11 @@ class MemoryStore:  # one SQLite file per runtime directory, bound to exactly on
             db = sqlite3.connect(f"{self.database.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
             db.execute("PRAGMA query_only = ON")
         else:
-            db = sqlite3.connect(str(self.database), timeout=10)
+            db = sqlite3.connect(str(self.database), timeout=BUSY_TIMEOUT)  # a sync can hold the write lock past 10 s
+            try:  # WAL: open readers (hooks, searches) no longer lock out writers; persistent, a no-op once set
+                db.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:  # another connection is open; a later call switches it
+                pass
         try:
             with db:
                 yield db

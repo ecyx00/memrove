@@ -81,7 +81,7 @@ class RulesTest(unittest.TestCase):
         self.assertNotIn("French", rules.block(d, "alpha", global_only=True))
         many = store([rec(f"q-{i}", "preference", "x", "2026-10-%02d" % (i % 28 + 1),
                           assessments=judged(f"The owner wants rule number {i} to hold with {'x' * 80} everywhere.")) for i in range(60)])
-        self.assertLessEqual(len(rules.block(many).encode()), 1500)
+        self.assertLessEqual(len(rules.block(many).encode()), rules.CAP)
 
     def test_kill_switch(self):
         d = store([rec("q-1", "preference", "ingilizce olmalı her şey", "2026-10-13", assessments=judged("Everything Claude writes is English."))])
@@ -101,6 +101,44 @@ class RulesTest(unittest.TestCase):
         self.assertIn("Everything Claude writes is English.", ctx)
         self.assertNotIn("widgetco", ctx)                # global only
 
+    def test_near_duplicate_rules_give_one_line(self):
+        d = store([rec("q-1", "preference", "x", "2026-10-01", assessments=judged("The owner wants Claude to search open source for existing parts before building anything new.")),
+                   rec("q-2", "preference", "x", "2026-10-02", assessments=judged("The owner wants Claude to search open source for existing parts before building anything new.")),
+                   rec("q-3", "preference", "x", "2026-10-03", assessments=judged("The owner wants Claude to search open source before building.")),
+                   rec("q-4", "preference", "x", "2026-10-04", assessments=judged("In scout, X, Instagram and TikTok scouts run daily.", "project", "scout")),
+                   rec("q-5", "preference", "x", "2026-10-05", assessments=judged("In scout, X, Instagram and TikTok posts are never stored whole.", "project", "scout")),
+                   rec("q-6", "rejected", "x", "2026-10-06", assessments=judged("Claude does not search open source for existing parts before building anything new."))])
+        texts = [t[2] for t in rules.rules(d, "scout")]
+        self.assertEqual(sum("search open source" in t and "does not" not in t for t in texts), 1, texts)
+        self.assertEqual(sum(t.startswith("In scout") for t in texts), 2)       # different rules on one topic both stay
+        self.assertTrue(any("does not search" in t for t in texts))              # a negation is a different rule
+        self.assertIn("The owner wants Claude to search open source for existing parts before building anything new.", texts)   # the fuller line wins
+        self.assertEqual([t[2] for t in rules.rules(store([rec("q-1", "preference", "x", "2026-10-01", assessments=judged("Frontend work stays on Claude Sonnet.")),
+                                                           rec("q-2", "preference", "x", "2026-10-02", assessments=judged("Frontend work stays on Claude Opus."))]))].__len__(), 2)   # a one-word swap is a different rule
+
+    def test_subagent_block_has_the_session_cap(self):
+        d = store([rec(f"q-{i}", "preference", "x", "2026-10-%02d" % (i % 28 + 1), assessments=judged(f"The owner wants rule number {i} about topic{i} kept here."))
+                   for i in range(30)])
+        r = subprocess.run([sys.executable, str(SCRIPTS / "memrove_v3_jit.py")], input=json.dumps({"hook_event_name": "SubagentStart", "agent_type": "coder"}),
+                           text=True, capture_output=True, env={**os.environ, "MEMROVE_STATE": d}, timeout=10)
+        ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(sum(f"rule number {i} " in ctx for i in range(30)), 8)   # the subagent form is capped at 8 global lines
+        self.assertNotIn("left out", ctx)
+
+    def test_subagent_start_carries_no_project_rules(self):
+        d = store([rec("q-1", "preference", "x", "2026-10-13", assessments=judged("Everything Claude writes is English.")),
+                   rec("q-2", "rejected", "x", "2026-10-13", project="acme", assessments=judged("In Acme, there is no widgetco.", "project", "acme")),
+                   rec("q-3", "rejected", "x", "2026-10-13", project="beta", assessments=judged("In Beta, there is no gadgetco.", "project", "beta"))])
+        for name in ("acme", "beta"):
+            cwd = Path(tempfile.mkdtemp(prefix="v3-sub-")) / name
+            (cwd / ".git").mkdir(parents=True)
+            r = subprocess.run([sys.executable, str(SCRIPTS / "memrove_v3_jit.py")], input=json.dumps({"hook_event_name": "SubagentStart", "agent_type": "coder", "cwd": str(cwd)}),
+                               text=True, capture_output=True, env={**os.environ, "MEMROVE_STATE": d}, timeout=10)
+            ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("Everything Claude writes is English.", ctx)
+            self.assertNotIn("widgetco", ctx)   # project rules reach a subagent only when recalled as relevant to its brief
+            self.assertNotIn("gadgetco", ctx)
+
     def test_only_restated_standing_rules_enter_the_block(self):
         d = store([
             rec("q-1", "preference", "açıklama yapma.", "2026-10-12"),                                       # never restated
@@ -116,13 +154,16 @@ class RulesTest(unittest.TestCase):
         self.assertEqual([ln for ln in b.splitlines()[1:]], ["- The owner wants commits in English."])
         self.assertEqual(rules.block(store([])), "")
 
-    def test_a_correction_hides_the_old_rule_before_it_is_restated(self):
-        d = store([
-            rec("q-old", "preference", "x", "2026-10-12", assessments=judged("The assistant must write everything in English.")),
-            rec("obs-new", "preference", "Everything is English, but replies to the user are in their language.", "2026-10-13", supersedes=["q-old"],
-                source="notes/observed/preference/new.md"),
-        ])
-        self.assertNotIn("The assistant must write everything in English.", rules.block(d, "demo"))
+    def test_a_correction_hides_the_old_rule_only_once_it_is_restated(self):
+        old = "The assistant must write everything in English."
+        new = "The assistant writes files in English but replies to the user in their language."
+        kw = dict(supersedes=["q-old"], source="notes/observed/preference/new.md")
+        pending = store([rec("q-old", "preference", "x", "2026-10-12", assessments=judged(old)),
+                         rec("obs-new", "preference", "Everything is English, but replies are in the user's language.", "2026-10-13", **kw)])
+        self.assertEqual(rules.block(pending, "demo").splitlines()[1:], ["- " + old])   # no gap while the correction waits
+        done = store([rec("q-old", "preference", "x", "2026-10-12", assessments=judged(old)),
+                      rec("obs-new", "preference", "x", "2026-10-13", assessments=judged(new), **kw)])
+        self.assertEqual(rules.block(done, "demo").splitlines()[1:], ["- " + new])
 
     def test_a_correction_marked_as_duplicate_of_the_old_rule_still_replaces_it(self):
         d = store([
@@ -144,8 +185,28 @@ class RulesTest(unittest.TestCase):
             self.assertIn("French", b)
         long = store([rec(f"q-{i}", "preference", "x", f"2026-10-{i + 1:02d}", assessments=judged(f"The owner wants rule number {i} about topic{i} kept {'long ' * 14}here."))
                       for i in range(20)])
-        lines = rules.block(long).splitlines()[1:]
+        lines = rules.block(long).splitlines()[1:-1]   # the last line is the left-out notice
         self.assertTrue(lines and all(ln.endswith(".") and "…" not in ln for ln in lines))   # whole sentences, the rest is left out
+
+    def test_hand_set_scope_wins_over_the_judgement(self):
+        d = store([rec("q-1", "preference", "x", "2026-10-07", assessments=judged("The owner wants every reply in French.")),
+                   rec("q-2", "preference", "x", "2026-10-08", assessments=judged("In Acme, the sidebar stays closed.", "project", "Acme"), rule_scope="global"),
+                   rec("q-3", "preference", "x", "2026-10-09", assessments=judged("The owner wants tabs over spaces.", "global"), rule_scope="Beta")])
+        self.assertEqual({t[2] for t in rules.rules(d, "alpha")}, {"The owner wants every reply in French.", "In Acme, the sidebar stays closed."})   # (a)(b)
+        self.assertIn("The owner wants tabs over spaces.", [t[2] for t in rules.rules(d, "beta")])
+        self.assertNotIn("tabs", rules.block(d, "alpha"))
+
+    def test_cap_ends_with_the_left_out_count_and_no_partial_rule(self):
+        d = store([rec(f"q-{i}", "preference", "x", f"2026-10-{i + 1:02d}", assessments=judged(f"The owner wants rule number {i} about topic{i} kept {'long ' * 14}here."))
+                   for i in range(80)])
+        b = rules.block(d, "alpha")
+        lines = b.splitlines()[1:]
+        self.assertLessEqual(len(b.encode()), rules.CAP)
+        n = len(lines) - 1
+        self.assertTrue(lines[-1].startswith(f"- ({80 - n} more rules left out") and "memrove rules --left-out --project 'alpha'" in lines[-1], lines[-1])
+        self.assertTrue(all(ln.endswith(".") for ln in lines[:-1]))
+        self.assertEqual(len(rules.left_out(d, "alpha")), 80 - n)
+        self.assertNotIn("left out", rules.block(d, "alpha", cap=20000))
 
     def test_capture_keeps_a_window_for_the_restate_step(self):
         from memrove_v3_capture import context_window
@@ -161,7 +222,7 @@ class RulesTest(unittest.TestCase):
         (tmp / "vault").mkdir(), (tmp / "state").mkdir()
         engine = SyncEngine(tmp / "vault", tmp / "state")
         engine.note_create("notes/captured/q-9.md", "ingilizce olmalı her şey", dict(
-            id="q-9", kind="preference", project=".claude", session="s", verified_by="user_quote", status="dropped_llm", key="k", polarity="pos",
+            id="q-9", kind="preference", project=".claude", session="s", verified_by="user_quote", status="active", key="k", polarity="pos",
             origin_type="user_explicit", ctx="owner: acme ui | assistant: UI strings are French"))
         seen = []
 
@@ -177,7 +238,7 @@ class RulesTest(unittest.TestCase):
             self.assertEqual(seen[0]["items"][0]["quote"], "ingilizce olmalı her şey")
             with engine.store._connect() as db:
                 r = json.loads(db.execute("SELECT payload FROM records WHERE id='q-9'").fetchone()[0])
-            self.assertEqual((r["status"], r["text"].strip()), ("dropped_llm", "ingilizce olmalı her şey"))   # quote and status untouched
+            self.assertEqual((r["status"], r["text"].strip()), ("active", "ingilizce olmalı her şey"))   # quote and status untouched
             self.assertEqual(r["assessments"]["restate"]["answers"]["sentence"], "In Acme, every UI string is English.")
             self.assertEqual(rs.restate_rules(engine, tmp / "vault", tmp / "state"), 0)   # once only
             log = tmp / "log.jsonl"
@@ -220,7 +281,7 @@ class RulesTest(unittest.TestCase):
         import memrove_v3_llm as llm
         import memrove_v3_restate as rs
         tmp = Path(tempfile.mkdtemp(prefix="v3-votes-"))
-        answers = iter(["yes", "yes", "no", "yes"])   # draw 1: a yes, b yes; draw 2: a no, b yes
+        answers = iter(["yes", "yes", "no", "yes", "no"])   # draw 1: a yes, b yes; draw 2: a no, b yes; draw 3 (a only, the split): no
 
         def runner(system, payload, vault=None):
             items = json.loads(payload)["items"]
@@ -229,7 +290,7 @@ class RulesTest(unittest.TestCase):
         llm.RUNNER = runner
         saved = {k: os.environ.pop(k, None) for k in ("MEMROVE_NO_LLM", "MEMROVE_INVOKED_BY", "MEMROVE_EVALUATOR")}
         try:
-            out = rs.two_votes(tmp, [{"id": "a", "text": "x", "revision": 1}, {"id": "b", "text": "y", "revision": 1}], tmp)
+            out = rs.two_votes(tmp, [{"id": "a", "text": "x", "revision": 1, "egress": "external_ok"}, {"id": "b", "text": "y", "revision": 1, "egress": "external_ok"}], tmp)
         finally:
             llm.RUNNER = llm._claude
             for k, v in saved.items():
@@ -288,6 +349,42 @@ class RulesTest(unittest.TestCase):
         finally:
             cs.chatlog.root = orig
         self.assertEqual(ids, {"rec:q-1", "rec:p-2"})
+
+
+class LoadedClaudeMdTest(unittest.TestCase):
+    def test_rule_already_in_a_loaded_claude_md_is_skipped_and_cap_is_6000(self):
+        from unittest.mock import patch
+        home = Path(tempfile.mkdtemp(prefix="v3-home-"))
+        proj = home / "proj"
+        proj.mkdir()
+        (proj / "CLAUDE.md").write_text("- The d1 decision model runs always-on, never loaded or unloaded.\n")
+        d = store([rec("q-1", "preference", "x", "2026-10-01", assessments=judged("In proj, the d1 decision model runs always-on, never loaded or unloaded.", "project", "proj")),
+                   rec("q-2", "preference", "x", "2026-10-02", assessments=judged("In proj, the exporter must write one file per customer report.", "project", "proj"))])
+        with patch.object(Path, "home", return_value=home):
+            b = rules.block(d, "proj", cwd=str(proj))
+            self.assertNotIn("d1 decision", b)
+            self.assertIn("exporter", b)
+            self.assertIn("d1 decision", rules.block(d, "proj"))   # no cwd: nothing is filtered
+            self.assertEqual([i for i, _, _ in rules.left_out(d, "proj", cwd=str(proj))], [])
+        self.assertEqual(rules.CAP, 6000)
+        many = store([rec(f"q-{i}", "preference", "x", "2026-10-%02d" % (i % 28 + 1),
+                          assessments=judged(f"The owner wants rule number {i} to hold with {'x' * 80} everywhere.")) for i in range(60)])
+        self.assertGreater(len(rules.block(many).encode()), 1500)
+
+    def test_negated_rule_is_not_skipped_and_stems_are_real(self):
+        line = rules._words("Claude must use pytest for all the tests in this repo.")
+        self.assertFalse(rules._in_loaded("Claude must not use pytest for tests in this repo.", [line]))
+        self.assertTrue(rules._in_loaded("Claude must use pytest for tests in this repo.", [line]))
+        self.assertTrue(rules._in_loaded("Never use pytest for tests in this repo.", [rules._words("Do not use pytest for tests in this repo.")]))
+        for neg in ("Claude doesn\u2019t use pytest for tests in this repo.", "Claude must avoid pytest for tests in this repo.", "Stop using pytest for tests in this repo."):
+            self.assertFalse(rules._in_loaded(neg, [line]), neg)   # curly apostrophe and avoid/stop are negations too
+        self.assertEqual(rules._words("needs add ids"), {"need", "add", "ids"})
+
+    def test_overlap_threshold_boundary(self):
+        line = [rules._words("alpha bravo charlie delta echo foxtrot golf hotel india juliet")]
+        self.assertTrue(rules._in_loaded("alpha bravo charlie delta echo foxtrot golf", line))     # 7/7 in line, 7 words
+        self.assertTrue(rules._in_loaded("alpha bravo charlie delta echo foxtrot golf kilo lima mike", line))   # 7/10 = 0.70
+        self.assertFalse(rules._in_loaded("alpha bravo charlie delta echo foxtrot kilo lima mike november", line))  # 6/10
 
 
 if __name__ == "__main__":

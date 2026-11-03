@@ -780,7 +780,11 @@ def run(state, vault, home=None, since=None, max_calls=None, dry_run=False, log=
         with hb.guard(state, "chatlog"):
             ing = chatlog.ingest(state, home, since, lean_before=lean_before)
         with hb.guard(state, "chattree"):
-            return {"ingest": ing, "compact": compact(state, vault, max_calls, dry_run, log, force)}
+            out = {"ingest": ing, "compact": compact(state, vault, max_calls, dry_run, log, force)}
+        if not dry_run:  # idea cards for the new owner messages, own daily cap (ideacards_cap); never raises
+            import memrove_v3_ideacards as ideacards
+            out["ideacards"] = ideacards.update(state, vault)
+        return out
 
 
 # ---- readers: wake, zoom, date ------------------------------------------------------------------------------------------
@@ -818,8 +822,36 @@ def wake_all(state):
     return "\n".join(wake(state, k) for k in range(1, len(pages([mem.tree.line(*p) for p in mem.view.parts])) + 1))
 
 
+def _page(r, i, page):
+    """One message whole, paged by PAGE; secrets are masked on display."""
+    body = r["kind"] + ": " + chatsearch.redact(r["text"])   # secrets are masked on display; the log keeps them
+    pg, cur, used = [], "", 0
+    for piece in re.findall(r"[^\n]*\n|[^\n]+$", body):
+        while u16(piece) > PAGE:  # one monster line: cut by characters
+            head, piece = piece[:PAGE // 2], piece[PAGE // 2:]
+            if used + u16(head) > PAGE:
+                pg.append(cur)
+                cur, used = "", 0
+            cur, used = cur + head, used + u16(head)
+        if used + u16(piece) > PAGE:
+            pg.append(cur)
+            cur, used = "", 0
+        cur, used = cur + piece, used + u16(piece)
+    pg.append(cur)
+    if not 1 <= page <= len(pg):
+        raise ValueError(f"page {page} does not exist: {len(pg)} pages")
+    tail = f"\n(page {page}/{len(pg)}" + (f": next `memrove zoom {i} 1 --page {page + 1}`" if page < len(pg) else "") + ")" if len(pg) > 1 else ""
+    return f"{i}+1|{r['kind']} ({r['date']})\n" + pg[page - 1] + tail
+
+
 def zoom(state, i, n, page=1):
     """Line i+n opened into the two lines it was made from; n = 1: message i whole (paged when long)."""
+    if isinstance(i, str) and i.startswith("x-"):   # a stable-id import: one message, never in the map
+        import memrove_v3_imports as imports
+        r = imports.get(state, i)
+        if r is None or n != 1:
+            raise ValueError(f"import {i} not found" if r is None else "an import is one message: n = 1")
+        return _page(r, i, page)
     mem = _mem(state)
     if n < 1 or n & (n - 1) or i % n or i < 0 or i + n > mem.T:
         raise ValueError(f"no line {i}+{n}: n is a power of 2, id a multiple of n, and the line ends by message {mem.T - 1}")
@@ -827,40 +859,28 @@ def zoom(state, i, n, page=1):
         r = chatlog.get(state, i)
         if r is None:
             raise ValueError(f"message {i} not found")
-        body = r["kind"] + ": " + chatsearch.redact(r["text"])   # secrets are masked on display; the log keeps them
-        pg, cur, used = [], "", 0
-        for piece in re.findall(r"[^\n]*\n|[^\n]+$", body):
-            while u16(piece) > PAGE:  # one monster line: cut by characters
-                head, piece = piece[:PAGE // 2], piece[PAGE // 2:]
-                if used + u16(head) > PAGE:
-                    pg.append(cur)
-                    cur, used = "", 0
-                cur, used = cur + head, used + u16(head)
-            if used + u16(piece) > PAGE:
-                pg.append(cur)
-                cur, used = "", 0
-            cur, used = cur + piece, used + u16(piece)
-        pg.append(cur)
-        if not 1 <= page <= len(pg):
-            raise ValueError(f"page {page} does not exist: {len(pg)} pages")
-        tail = f"\n(page {page}/{len(pg)}" + (f": next `memrove zoom {i} 1 --page {page + 1}`" if page < len(pg) else "") + ")" if len(pg) > 1 else ""
-        return f"{i}+1|{r['kind']} ({r['date']})\n" + pg[page - 1] + tail
+        return _page(r, i, page)
     l = n.bit_length() - 1
     return "\n".join(mem.tree.line(l - 1, (i >> (l - 1)) + k) for k in (0, 1))
 
 
 def date_of(state, i):
+    if isinstance(i, str) and i.startswith("x-"):
+        import memrove_v3_imports as imports
+        r = imports.get(state, i)
+        if r is None:
+            raise ValueError(f"import {i} not found")
+        return datetime.fromisoformat(r["date"]).strftime("%Y-%m-%d %H:%M:%S %z")
     r = chatlog.get(state, i)
     if r is None:
         raise ValueError(f"message {i} not found")
     return datetime.fromisoformat(r["date"]).strftime("%Y-%m-%d %H:%M:%S %z")
 
 
-INSTRUCTION = """Memrove chat memory is on: every past user message and agent reply, from all sessions, summarized into a map. Kinds: user = the user's words, agent = the agent's replies.
+INSTRUCTION = """Memrove chat memory is on: every past user message and agent reply, from all sessions, summarized into a map.
 Before you answer or start a task that may build on earlier work, search first; a hit or a doc line is a lead, not evidence; open it with zoom or memrove doc and answer from what you opened. On one topic the newer statement wins, and the user's word beats an agent's.
 - `memrove search "<words>"` finds messages and the saved decisions, lessons and notes (`rec:<id>` lines; `memrove show <id>` opens one with its why).
-- `memrove wake` prints the map (more parts: `memrove wake 2`, ...); each line is `id+n|summary` of the n messages from id on. `memrove zoom <id> <n>` opens it into the two lines it was made from (n=1 gives the message whole); `memrove date <id>` gives its date.
-- Summaries keep little: the map is an index to open, not a source to quote."""
+- `memrove wake` prints the map (more parts: `memrove wake 2`, ...); each line is `id+n|summary` of the n messages from id on. `memrove zoom <id> <n>` opens it into the two lines it was made from (n=1 gives the message whole); `memrove date <id>` gives its date."""
 
 
 def instruction(state):

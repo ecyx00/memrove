@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 tmp-brief/
 release/
+
+# private working notes
+docs/state/
+papercuts.md

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""memrove command line: chat memory, saved records, project views and maintenance."""
+"""memrove command line: chat memory, saved records, project views and maintenance.
+
+Readers other than Claude Code, Codex or an interactive terminal (opencode, Gemini, scripts) see only records their tier may see
+(egress labels): MEMROVE_READER=local|paid|free sets the tier by hand."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +19,7 @@ MODULES = HERE if (HERE / "memrove_v3_sync.py").exists() else HERE.parent / "tem
 sys.path.insert(0, str(MODULES))
 
 RECORD_KINDS = ("decision", "rejected", "lesson", "preference", "note")
-WRITES_STATE = {"sync", "remember", "backfill"}  # every other command opens the store read-only
+WRITES_STATE = {"sync", "remember", "backfill", "rule-scope", "card", "trigger"}  # every other command opens the store read-only
 
 
 def default_state(vault) -> Path:
@@ -50,6 +53,11 @@ def opt(*flags, **kw):
     return flags, kw
 
 
+def msg_id(v):
+    """A chat-log message number, or a stable import id (x-<hash>)."""
+    return v if v.startswith("x-") else int(v)
+
+
 ON_OFF = dict(choices=("on", "off"))
 COMMANDS = {
     "init": ("Initialise local state; installs no hooks or services", []),
@@ -57,8 +65,8 @@ COMMANDS = {
     "wake": ("Chat memory: print the view (id+n|summary lines for the whole history), one part at a time", [
         opt("part", nargs="?", type=int, default=1), opt("--all", action="store_true", help="print every part")]),
     "zoom": ("Chat memory: open line id+n into the two lines it was made from; n=1 gives message id whole", [
-        opt("id", type=int), opt("n", type=int), opt("--page", type=int, default=1)]),
-    "date": ("Chat memory: the date and time of message id", [opt("id", type=int)]),
+        opt("id", type=msg_id), opt("n", type=int), opt("--page", type=int, default=1)]),
+    "date": ("Chat memory: the date and time of message id", [opt("id", type=msg_id)]),
     "doc": ("Print a docs write-up (or one section) that a search handle points to; indexed doc roots only", [
         opt("path"), opt("--section", help="heading of the section to print; default the whole file")]),
     "rebrief": ("Metric: owner prompts that ask for the same thing again in another session", [
@@ -90,6 +98,13 @@ COMMANDS = {
         opt("--dry-run", action="store_true", help="report what would be imported; write nothing"),
         opt("--home", type=Path, help="home directory holding .codex / .gemini"),
         opt("--sample", type=int, default=5, help="sample size in the report")]),
+    "import-chats": ("Import chat history the live log does not read (Antigravity overview.txt, web exports) under stable x-<hash> ids; idempotent, no model calls", [
+        opt("--source", help="one reader name (default: all)"),
+        opt("--full", action="store_true", help="also the agent's narration messages (default: user turns and final answers)"),
+        opt("--dry-run", action="store_true", help="count only; write nothing"),
+        opt("--extract", action="store_true", help="then run J2 (Haiku) over the imported messages and link the new records"),
+        opt("--max-cost", type=float, default=1.0, help="extract: stop at this many dollars"),
+        opt("--home", type=Path, default=Path.home(), help="home directory holding .gemini / .codex")]),
     "backup": ("Copy vault and state (consistent SQLite snapshot plus manifest) into an empty --dest", [
         opt("--dest", required=True, type=Path)]),
     "restore": ("Restore a backup into an empty vault and state directory; never overwrites", [
@@ -126,13 +141,37 @@ COMMANDS = {
         opt("--max-bytes", type=int, default=5000)]),
     "graph": ("Link graph: neighbors <id|title> | hub <project> | related \"<text>\" | link <a> <b> --type T --why W | concept <name> | run", [
         opt("rest", nargs=argparse.REMAINDER, help="arguments of the graph subcommand (see: memrove graph --help)")]),
+    "rules": ("Standing rules pushed to a project's sessions: id|scope|sentence", [
+        opt("--project", help="default: project of the current directory"), opt("--left-out", action="store_true", help="only the rules the size cap leaves out of the push"),
+        opt("--cwd", default=".")]),
+    "rule-scope": ("Set where a standing rule applies: global or one project name (overrides the model's judgement)", [
+        opt("id"), opt("scope", help="'global' or a project name")]),
     "remember": ("Save one decision, rejected option, lesson, preference or note; prints the id", [
         opt("text"), opt("--kind", required=True, choices=RECORD_KINDS), opt("--why"),
         opt("--project", help="default: project root name of --cwd"),
         opt("--user", action="store_true", help="the text quotes the user verbatim (origin user_explicit)"),
         opt("--session", help="default: CLAUDE_CODE_SESSION_ID, else the newest transcript of --cwd"),
         opt("--supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; repeatable"),
+        opt("--check", help="read-only shell line that exits 0 while the record is true (allowlisted, 5 s); dry-run now, refused if it fails"),
+        opt("--scope", help="where it was measured: repo, workload, n"),
         opt("--topic", help="slug of the topic this decision belongs to; the newest entry per topic is its head (the nudge lists existing slugs)"),
+        opt("--trigger-tool", action="append", default=[], help="tool name the PreToolUse hook matches (Bash, Agent, ...); repeatable; needs --trigger"),
+        opt("--trigger", help="regex over the command (Bash) or the JSON tool_input; the hook shows this record when a --trigger-tool call matches"),
+        opt("--trigger-cwd", help="regex the working directory must also match"),
+        opt("--trigger-deny", action="store_true", help="refuse the tool call instead of warning"),
+        opt("--cwd", default=".")]),
+    "trigger": ("Make a record fire in the PreToolUse hook: trigger <id> --tool T --match RX (RX runs on tool_input.command if a string, else the JSON tool_input) [--cwd RX] [--deny]; trigger --list; trigger <id> --clear", [
+        opt("id", nargs="?"), opt("--tool", action="append", default=[]), opt("--match"), opt("--cwd"),
+        opt("--deny", action="store_true"), opt("--clear", action="store_true"), opt("--list", action="store_true")]),
+    "pack": ("Push block of one arm as memory looked at a past moment (replay): none | rules | card | graph", [
+        opt("--arm", required=True, choices=("none", "rules", "card", "graph")), opt("--project", required=True), opt("--prompt", default=""),
+        opt("--as-of", required=True, help="ISO time; only records, cards and rules from before it"), opt("--exclude-session", default="", help="session whose records must not appear"),
+        opt("--cap", type=int, default=1500), opt("--cache", type=Path, help="card draft cache (default ~/.cache/memrove-pack)"),
+        opt("--transcripts", type=Path, help="Claude Code projects directory (default ~/.claude/projects)")]),
+    "card": ("Write this session's handoff card (the next session in this project starts with it); rewrites the card in place", [
+        opt("--did", action="append", default=[], help="what was done; repeatable"), opt("--why", action="append", default=[], help="why; repeatable"),
+        opt("--open", action="append", default=[], help="what is still open; repeatable"), opt("--next", default="", help="the first step next time"),
+        opt("--project", help="default: project root name of --cwd"), opt("--session", help="default: CLAUDE_CODE_SESSION_ID, else the newest transcript of --cwd"),
         opt("--cwd", default=".")]),
 }
 
@@ -367,6 +406,10 @@ def cmd_doctor(args, ctx):
     report["secret_filter"] = secret_health(state)
     report["secrets_redacted"] = report["secret_filter"]["total"]
     _guarded(report, "writers", lambda: memrove_v3_heartbeat.check(state))
+    def stale():
+        import memrove_v3_checks
+        return [{"id": "rec:" + k, "check": v["check"], "why": v["why"]} for k, v in memrove_v3_checks.failing(state).items()]
+    _guarded(report, "may_be_stale", stale)
     _guarded(report, "docs", lambda: memrove_v3_docs.doctor(store))
     def topic_heads():
         import memrove_v3_heads
@@ -409,10 +452,20 @@ def cmd_import_sessions(args, ctx):
     return emit(sessions.run(args.harness, ctx.vault, ctx.state, args.dry_run, args.home, args.sample))
 
 
+def cmd_import_chats(args, ctx):
+    import memrove_v3_imports as imports
+    out = imports.run(ctx.state, args.home, args.source, args.full, args.dry_run)
+    if args.extract and not args.dry_run:
+        out["extract"] = imports.extract(ctx.engine(), ctx.vault, ctx.state, args.max_cost)
+    return emit(out)
+
+
 def cmd_search(args, ctx):
+    ok = getattr(args, "visible", None)
     if args.records:
         from memrove_v3_recall import search
-        hits = search(ctx.store(), args.query, args.limit or 10)
+        n = args.limit or 10
+        hits = [h for h in search(ctx.store(), args.query, n * 5 if ok else n) if not ok or ok(str(h.get("id", "")))][:n]   # filtered after a wider pull, so a restricted reader still gets up to n
         if not args.compact:
             return emit(hits)
         for hit in hits:
@@ -421,24 +474,72 @@ def cmd_search(args, ctx):
     if not args.query.strip() and not (args.since or args.until):
         raise ValueError("search needs a query or --since / --until")
     import memrove_v3_chatsearch as chat_search
-    print(chat_search.search(ctx.state, args.query, *([args.limit] if args.limit else []), since=args.since, until=args.until, history=args.history))
+    out = chat_search.search(ctx.state, args.query, *([args.limit] if args.limit else []), since=args.since, until=args.until, history=args.history)
+    print(_reader_lines(out, ok) if ok else out)
     return 0
+
+
+MESSAGE_LINE = re.compile(r"^(\d+|x-[0-9a-f]+)\|")
+
+
+def _reader_lines(text, ok):
+    """Search output for a reader that may not see every record: message lines stay, a rec: line stays when ok(id); heads, docs and graph
+    neighbour lines (agent write-ups and records it cannot check) go. Allow-list, so a new line type stays hidden until it is added here."""
+    keep = [ln for ln in text.splitlines() if MESSAGE_LINE.match(ln) or ((m := re.match(r"^rec:([^|]+)\|", ln)) and ok(m.group(1)))]
+    return "\n".join(keep) if keep else "no message matches"
+
+
+def _record_check(state, tier):
+    """-> ok(record id): may a reader of this tier see the record (egress label, derived_from sources included)? Unknown id -> False."""
+    import sqlite3
+    from memrove_v3_trust import egress_of, visible_to
+    path = Path(state) / "memory.sqlite3"
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True) if path.exists() else None
+
+    def ok(rid):
+        row = db.execute("SELECT payload FROM records WHERE id=?", (rid.removeprefix("rec:"),)).fetchone() if db else None
+        return bool(row) and visible_to(egress_of(json.loads(row[0]), db), tier)
+    return ok
 
 
 def cmd_show(args, ctx):
     from memrove_v3_recall import show
-    return emit(show(ctx.store(), args.id.removeprefix("rec:")), ensure_ascii=False)
+    ok = getattr(args, "visible", None)
+    if ok and not ok(args.id):
+        raise PermissionError(f"record {args.id} is not shown to this reader (egress label); the owner can set MEMROVE_READER=local for a harness that may see every record")
+    out = show(ctx.store(), args.id.removeprefix("rec:"))
+    if isinstance(out, dict) and out.get("kind") != "thread":
+        import memrove_v3_neighbours as neighbours
+        edges = [e for e in neighbours.edges_of(ctx.state, out.get("id", "")) if not ok or ok(str(e.get("id", "")))]   # a neighbour's summary is record text too
+        if edges:
+            out["edges"] = edges
+    return emit(out, ensure_ascii=False)
 
 
 def cmd_remember(args, ctx):
     from memrove_v3_context import remember
     cwd = Path(args.cwd).expanduser().resolve()
     project = args.project or project_name(cwd, ctx.state)
+    trigger = None
+    if args.trigger or args.trigger_tool:  # validate before anything is saved
+        import memrove_v3_triggers
+        trigger = memrove_v3_triggers.spec(args.trigger_tool, args.trigger, args.trigger_cwd, args.trigger_deny)
     result = remember(ctx.engine(), args.kind, args.text, args.why, project, args.user,
-                      args.session or current_session(cwd), supersedes=args.supersedes, topic=args.topic)
+                      args.session or current_session(cwd), supersedes=args.supersedes, topic=args.topic, check=args.check, measured=args.scope)
     if result["status"] == "exists":
         print(result["id"] + " (exists)", file=sys.stderr)
     print(result["id"])
+    if trigger:
+        memrove_v3_triggers.set_trigger(ctx.vault, ctx.state, result["id"], trigger)
+    if result["status"] != "exists":
+        try:  # write-time linking: queue the record, a detached worker makes the model call
+            import memrove_v3_graph as graph
+            graph.enqueue(ctx.state, result["id"])
+            graph.kick(ctx.vault, ctx.state, Path(__file__).resolve())
+        except Exception:
+            pass
+    if getattr(args, "visible", None):   # the nudge and topic lines quote other records and write-ups unfiltered: only a local reader gets them
+        return 0
     if result["status"] != "exists" and not args.supersedes and args.kind != "note":
         try:
             from memrove_v3_nudge import nudge
@@ -457,12 +558,89 @@ def cmd_remember(args, ctx):
     return 0
 
 
+def cmd_rules(args, ctx):
+    import memrove_v3_rules as R
+    cwd = Path(args.cwd).expanduser().resolve()
+    project = args.project or project_name(cwd, ctx.state)
+    items = R.left_out(ctx.state, project, cwd) if args.left_out else [(i, t, r) for _, t, r, i in R.rules(ctx.state, project, cwd=cwd)]
+    ok = getattr(args, "visible", None)
+    for i, tag, rule in items:
+        if ok and not ok(i):
+            continue
+        print(f"{i}|{tag or 'global'}|{rule}")
+    return 0
+
+
+def cmd_rule_scope(args, ctx):
+    from memrove_v3_projections import update_record
+    scope = args.scope.strip()
+    import sqlite3
+    with sqlite3.connect(f"file:{ctx.state / 'memory.sqlite3'}?mode=ro", uri=True) as db:
+        ids = [i for (i,) in db.execute("SELECT id FROM records WHERE id=? OR id LIKE ?", (args.id, args.id + "%"))]
+    ids = [args.id] if args.id in ids else ids
+    if len(ids) != 1 or not scope:
+        print(f"{'no record' if not ids else 'ambiguous prefix'} for {args.id!r}" if scope else "scope is empty", file=sys.stderr)
+        return 2
+    update_record(ctx.engine(), ids[0], {"rule_scope": scope})
+    print(f"{ids[0]} -> {scope}")
+    return 0
+
+
+def cmd_trigger(args, ctx):
+    import memrove_v3_triggers as trig
+    if args.list:
+        trig.compile(ctx.vault, ctx.state)
+        for e in trig.entries(ctx.vault, ctx.state):
+            print(f"{e['id']}|{'deny' if e['deny'] else 'warn'}|{','.join(e['tools'])}|{e['match']}|{e['cwd']}|{e['text'][:80]}")
+        return 0
+    import sqlite3
+    if not args.id or not (args.clear or (args.tool and args.match)):
+        print("usage: trigger <id> --tool T --match RX [--cwd RX] [--deny] | <id> --clear | --list", file=sys.stderr)
+        return 2
+    with sqlite3.connect(f"file:{ctx.state / 'memory.sqlite3'}?mode=ro", uri=True) as db:
+        ids = [i for (i,) in db.execute("SELECT id FROM records WHERE id=? OR id LIKE ?", (args.id.removeprefix("rec:"), args.id.removeprefix("rec:") + "%"))]
+    ids = [args.id.removeprefix("rec:")] if args.id.removeprefix("rec:") in ids else ids
+    if len(ids) != 1:
+        print(f"{'no record' if not ids else 'ambiguous prefix'} for {args.id!r}", file=sys.stderr)
+        return 2
+    value = None if args.clear else trig.spec(args.tool, args.match, args.cwd, args.deny)
+    trig.set_trigger(ctx.vault, ctx.state, ids[0], value)
+    print(f"{ids[0]} -> {'cleared' if args.clear else value}")
+    return 0
+
+
+def cmd_card(args, ctx):
+    import memrove_v3_card as card
+    from datetime import date
+    cwd = Path(args.cwd).expanduser().resolve()
+    sid = args.session or current_session(cwd)
+    if not sid:
+        raise ValueError("no session id: pass --session")
+    engine, cid = ctx.engine(), "c-" + sid[:12]
+    meta = {"project": args.project or project_name(cwd, ctx.state), "session": sid, "origin": "agent", "origin_type": "agent_inference",
+            "valid_from": date.today().isoformat(), "did": args.did, "why": args.why, "open": args.open, "next": args.next}
+    card.upsert(engine, cid, meta, card._sources(engine, sid))
+    print(cid)
+    return 0
+
+
+def cmd_pack(args, ctx):
+    import memrove_v3_pack as pack
+    try:
+        sys.stdout.write(pack.pack(ctx.state, args.arm, args.project, args.prompt, args.as_of, args.exclude_session, args.cap,
+                                   args.cache, args.transcripts, ctx.vault))
+    except RuntimeError as exc:   # a missing graph module or a spent draft budget: say so for this arm only
+        print(str(exc), file=sys.stderr)
+        return 2
+    return 0
+
+
 HANDLERS = {"init": cmd_init, "sync": cmd_sync, "wake": cmd_chat, "zoom": cmd_chat, "date": cmd_chat, "chatlog": cmd_chat,
             "rebrief": cmd_rebrief, "doc": cmd_doc, "grab": cmd_grab, "project": cmd_project, "graph": cmd_graph,
             "wiki": cmd_wiki, "backup": cmd_backup, "restore": cmd_restore, "preferences": cmd_preferences,
             "recall-stats": cmd_recall_stats, "doctor": cmd_doctor, "companion-compact": cmd_compact,
-            "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "search": cmd_search, "show": cmd_show,
-            "remember": cmd_remember}
+            "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "show": cmd_show,
+            "remember": cmd_remember, "rules": cmd_rules, "rule-scope": cmd_rule_scope, "trigger": cmd_trigger, "card": cmd_card, "pack": cmd_pack}
 
 
 def resolve_paths(args):
@@ -476,13 +654,25 @@ def resolve_paths(args):
     return vault, state
 
 
+# Commands a reader below local (opencode, Gemini, a script) may run: chat memory (Claude Code transcripts, external_ok), writes, and the
+# record commands that filter by egress. Every other command prints records or write-ups unfiltered, so it is refused (allow-list).
+READER_SAFE = {"init", "sync", "wake", "zoom", "date", "chatlog", "remember", "card", "search", "show", "rules"}
+
+
 def main(argv=None):
     for stream in (sys.stdin,):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = parser().parse_args(argv)
     try:
-        return HANDLERS[args.command](args, Context(*resolve_paths(args)))
+        from memrove_v3_trust import reader_tier
+        paths, tier = resolve_paths(args), reader_tier()
+        if tier != "local":
+            if args.command not in READER_SAFE:
+                raise PermissionError(f"`memrove {args.command}` prints records unfiltered; this reader is tier {tier} (not Claude Code, Codex or a terminal). "
+                                      "The owner can set MEMROVE_READER=local for a harness that may see every record.")
+            args.visible = _record_check(paths[1], tier)
+        return HANDLERS[args.command](args, Context(*paths))
     except Exception as exc:  # no traceback and no input echo: the caller still has its source files
         print(json.dumps({"error": type(exc).__name__, "message": str(exc)}), file=sys.stderr)
         return 1

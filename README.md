@@ -55,7 +55,7 @@ Open the vault folder in a new Claude Code or Codex session. In Codex, review an
 
 Installer options: `--python EXE` picks the interpreter baked into the hooks and the `memrove` wrapper (the installer warns when the running python looks like conda or a venv, which breaks when that environment goes away); `--workspace-root DIR` (repeatable) lists a folder whose direct subfolders are separate projects, for one big vault of many apps, even when the folder holds a `CLAUDE.md` or subfolders hold their own markers. Keep memrove's own vault outside that folder: a session inside memrove's vault resolves to no project.
 
-Doc search (`memrove search` doc handles) reads write-ups under `<repo>/docs/{state,design,research,decisions}` of the repos named in `MEMROVE_DOC_REPOS` (a `:`-separated list of repo directories) and of nothing else by default.
+Doc search (`memrove search` doc handles) reads write-ups under `<repo>/docs/{state,audits,research,design,handoff,decisions}` of the repos named in `MEMROVE_DOC_REPOS` (a `:`-separated list of repo directories or globs such as `~/Projects/*`; a glob keeps only directories with a `docs/` folder and is expanded on every search) and of nothing else by default.
 
 ### Viewing the graph
 

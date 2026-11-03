@@ -13,6 +13,11 @@ SECTIONS = (("user", "USER RULES", 25), ("project", "PROJECT", 25), ("decisions"
 DEAD = ("retired", "rejected", "dropped_llm", "deleted_by_user", "source_missing")
 
 
+def is_dead(r, now):
+    """Not live for recall or triggers: dead status, rejected, private, or valid_to already passed (now = naive-UTC ISO string)."""
+    return r.get("status") in DEAD or r.get("verdict") == "reject" or bool(r.get("valid_to") and str(r["valid_to"]) <= now) or r.get("visibility") == "private"
+
+
 def observe(sync, kind, source, payload, scope=None, core=False):
     """-> {id, revision, status: created|exists}. Idempotent on (source, kind, source_item_id)."""
     spec = kinds.spec(kind)
@@ -85,7 +90,7 @@ def context_pack(store, task, project=None, scope="all", budget=800, client="cla
             e["reason"] = "out_of_scope"
         elif r["id"] in gone or r.get("status") == "superseded":
             e["reason"] = "superseded"
-        elif r.get("status") in DEAD or r.get("verdict") == "reject" or (r.get("valid_to") and str(r["valid_to"]) <= now) or r.get("visibility") == "private":
+        elif is_dead(r, now):
             e["reason"] = "retired"
         elif r.get("kind") == "lesson" and project and r.get("project") != project and lesson_admission(r, corroboration([r])) != "admit":
             e["reason"] = "lesson_not_admitted"
@@ -129,7 +134,33 @@ def context_pack(store, task, project=None, scope="all", budget=800, client="cla
 REMEMBER_KINDS = ("decision", "rejected", "lesson", "preference", "note")
 
 
-def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None):
+def _retry_locked(sync, fn, budget=120.0):
+    """Hook workers can hold the write lock past the connect timeout: retry "database is locked" with backoff.
+    A write that landed its file but not its record is finished by a sync before the next try (observe is idempotent).
+    -> (result, tries); after a retry, "source exists" means our own earlier file is not indexed yet, so it is retried too."""
+    import sqlite3
+    import time
+    end, pause, tries = time.monotonic() + budget, 0.5, 0
+    while True:
+        if tries and time.monotonic() > end:  # the between-try sync can outlast the budget
+            raise last
+        tries += 1
+        try:
+            return fn(), tries
+        except (sqlite3.OperationalError, ValueError) as exc:
+            last = exc
+            locked = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+            if not (locked or (tries > 1 and "source exists" in str(exc))) or time.monotonic() + pause > end:
+                raise
+        time.sleep(pause)
+        pause = min(pause * 2, 8.0)
+        try:
+            sync.sync(full=False)
+        except Exception:  # noqa: BLE001 - a failed between-try sync must not mask the locked error
+            pass
+
+
+def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None):
     """Model-written memory: same observe contract (validate, commit, readback), core kinds allowed. Idempotent on (kind, text)."""
     from memrove_v3_capture import has_secret, key_of
     if kind not in REMEMBER_KINDS:
@@ -153,6 +184,14 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
         payload["session"] = session
     if kind == "rejected":
         payload["polarity"] = "neg"
+    if check:  # executable memory: dry run now, so a bad check is never stored (7 of 15 first-run failures were bad checks)
+        from memrove_v3_checks import run as run_check
+        ok, reason = run_check(check)
+        if not ok:
+            raise ValueError(f"check refused, record not saved: {reason}")
+        payload["check"] = check.strip()
+    if measured:
+        payload["measured"] = " ".join(measured.split())
     if topic:  # the writer's key: the newest decision/rejected per (project, topic) is the head (memrove_v3_heads)
         from memrove_v3_heads import slug
         if slug(topic):
@@ -167,7 +206,12 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
                     raise ValueError(f"no unique record to supersede for {old!r}")
                 found.append(old if any(r[0] == old for r in rows) else rows[0][0])
         payload["supersedes"] = found
-    result = observe(sync, kind, source, payload, core=kind != "note")
+    result, tries = _retry_locked(sync, lambda: observe(sync, kind, source, payload, core=kind != "note"))
+    if tries > 1 and result.get("status") == "exists":  # our own file landed on an earlier try and a sync indexed it
+        result["status"] = "created"
+    if supersedes:
+        from memrove_v3_checks import forget
+        forget(sync.state, payload["supersedes"])
     try:
         if result.get("status") != "exists":
             import memrove_v3_decide_log as dl

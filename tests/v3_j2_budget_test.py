@@ -98,6 +98,23 @@ class J2BudgetTest(base.Base):
         self.assertEqual((row['job'], row['session'], row['users']), ('j2', 's6', 1))
         self.assertEqual(queue.config(self.state)['j4_share'], 0.10)
 
+    def test_history_window_is_stamped_with_its_own_date(self):
+        tp = self.root / 'may.jsonl'
+        tp.write_text(base.line(type='user', timestamp='2026-05-01T10:00:00Z', message={'content': 'we chose paddleocr for mobile'}), encoding='utf-8')
+        self.runner = lambda system, payload, vault=None: (json.dumps(dict(GOOD, decisions=['use paddleocr on mobile'])), 0.0006, None)
+        llm.RUNNER = self.runner
+        ev = dict(self.ev('may1', tp, 'SessionEnd'), day='2026-10-19', history=True)
+        self.assertEqual(self.notes([ev]), 1)
+        got = [r['valid_from'] for r in self.records().values() if r.get('session') == 'may1' and r.get('kind') == 'decision']
+        self.assertEqual(got, ['2026-05-01'])
+
+    def test_history_order_is_by_date_across_sources(self):
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import history_import as h
+        items = [dict(source='codex', sid='c', start='2026-06-02'), dict(source='claude', sid='a', start='2026-10-01'),
+                 dict(source='antigravity', sid='g', start='2026-05-09'), dict(source='claude', sid='b', start='2026-06-02')]
+        self.assertEqual([i['sid'] for i in h.order(items)], ['g', 'b', 'c', 'a'])
+
 
 if __name__ == '__main__':
     unittest.main()

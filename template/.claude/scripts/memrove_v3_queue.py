@@ -44,7 +44,7 @@ def allowed(state, job, usage):
     if job == "j2":
         return total < cap
     held = max(0, math.ceil(cap * cfg["j2_reserve"]) - by.get("j2", 0))
-    if job != "j1":
+    if job not in ("j1", "card"):   # a handoff card is one call per session, as urgent as J1
         held += max(0, math.ceil(cap * cfg["j1_reserve"]) - by.get("j1", 0))
     if total + held >= cap:
         return False

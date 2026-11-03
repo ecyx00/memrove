@@ -12,6 +12,7 @@ from pathlib import Path
 KINDS = ("decision", "rejected")
 GONE = ("retired", "dropped_llm", "deleted_by_user", "source_missing")
 DAY = re.compile(r"^(\d{4}-\d{2}-\d{2})-?(.*)$")
+CACHE_VERSION = 1  # bump when _writeup output changes
 READ = 16000  # bytes of a write-up read for its front matter, title and verdict section
 EXP = re.compile(r"^(e\d+)(?:-|$)")  # experiment prefix groups front-matter-less files: e87-arms, e87-job-set -> e87
 VERDICT = re.compile(r"verdict|result|outcome|summary|decision|finding", re.I)
@@ -101,9 +102,50 @@ def entries(state, project=None):
     out = [e for e in _records(state) if project in (None, e["project"])]
     import memrove_v3_docsearch as ds
     names = {project} if project else {r.name for r in ds.repos()}
+    old, new = _load_cache(state), {}
     for name in sorted(names):
-        out += [e for e in (_writeup(p, name, b) for p, b in _writeup_paths(name)) if e]
+        out += _cached_writeups(name, old, new)
+    _save_cache(state, old, new, names)
     return out
+
+
+def _load_cache(state):
+    try:
+        c = json.loads((Path(state) / "heads-cache.json").read_text(encoding="utf-8"))
+        return c["files"] if c.get("version") == CACHE_VERSION else {}
+    except (OSError, ValueError, KeyError, AttributeError):
+        return {}
+
+
+def _cached_writeups(name, old, new):
+    """_writeup of each file of a project, re-parsed only when its (mtime_ns, size) changed or the cache VERSION differs. Fills `new`."""
+    out = []
+    for p, b in _writeup_paths(name):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        sig = [st.st_mtime_ns, st.st_size, name, str(b)]
+        hit = old.get(str(p))
+        e = hit[1] if hit and hit[0] == sig else _writeup(p, name, b)
+        new[str(p)] = [sig, e]
+        if e:
+            out.append(e)
+    return out
+
+
+def _save_cache(state, old, new, names):
+    """Files of the projects walked are replaced by what was seen (a removed file drops out); other projects' entries stay."""
+    merged = {k: v for k, v in old.items() if v[0][2] not in names}
+    merged.update(new)
+    if merged == old:
+        return
+    try:
+        tmp = Path(state) / f"heads-cache.json.{os.getpid()}"
+        tmp.write_text(json.dumps({"version": CACHE_VERSION, "files": merged}), encoding="utf-8")
+        os.replace(tmp, Path(state) / "heads-cache.json")
+    except OSError:
+        pass
 
 
 def build(items):
@@ -160,13 +202,13 @@ def topics(state, project, n=8):
     return [h["topic"] for h in hs if h["keyed"]][:n]
 
 
-def match(state, query, n=2):
+def match(state, query, n=2, hs=None):
     """Heads whose words cover the query terms (>= 2 shared, or all when the query is short): [head]."""
     from memrove_v3_recall import terms
     q = set(terms(query))
     if not q:
         return []
-    hs, _ = heads(state)
+    hs = heads(state)[0] if hs is None else hs
     scored = []
     for h in hs:
         shared = len(q & set(terms(f"{h['topic']} {h['decision']} {h['next']}")))

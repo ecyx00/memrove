@@ -2,6 +2,7 @@
 """Lifecycle hook for Claude Code and Codex. Hot path: print a short notice, queue metadata, start a detached worker.
 Capture, sync and the model jobs run in that worker, never in the hook."""
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -49,12 +50,21 @@ def skip_session(payload):
     """Opt-outs: a .memrove/no-memory marker in the project, and headless sdk-cli runs."""
     if (project_root(payload.get("cwd")) / ".memrove" / "no-memory").exists():
         return True
+    return is_sdk(payload) and not headless_recall()
+
+
+def is_sdk(payload):
     if payload.get("entrypoint") == "sdk-cli" or os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli":
         return True
     if payload.get("transcript_path"):
         from memrove_v3_capture import headless
         return headless(payload["transcript_path"])
     return False
+
+
+def headless_recall():
+    """Opt-in MEMROVE_HEADLESS_RECALL=1: a headless sdk-cli run gets read-side hook context only; main() queues nothing for it (ingest skips its transcript)."""
+    return os.environ.get("MEMROVE_HEADLESS_RECALL") == "1"
 
 
 def atomic(path, data):
@@ -101,7 +111,27 @@ def pastref_line(payload, state=None):
         if not enabled or is_synthetic_prompt(payload):
             return ""
         from memrove_v3_pastref import LINE, is_past_reference
-        return LINE if is_past_reference(prompt_text(payload)) else ""
+        if not is_past_reference(prompt_text(payload)):
+            return ""
+        return LINE + (doc_pointers(payload, state) if os.environ.get("MEMROVE_PASTREF_POINTERS") == "1" else "")   # pointers cost 2.3 s against the 2 s hook timeout and were never opened
+    except Exception:
+        return ""
+
+
+def doc_pointers(payload, state):
+    """'\n'-led block of up to 3 `path — decision: ...` doc pointers (no content) for the prompt, or ''. Logged as a memrove.inject
+    row (section `pointers`) so `memrove recall-stats` reports opened/cited/ignored for them."""
+    try:
+        import memrove_v3_decide_log as dl
+        import memrove_v3_docsearch as ds
+        from memrove_v3_project import sticky
+        found = ds.pointers(state, prompt_text(payload), payload.get("cwd"))
+        if not found:
+            return ""
+        session = session_key(payload)
+        project = sticky(Path(state), session, payload.get("cwd") or ".", transcript=payload.get("transcript_path"))[0] or "unknown"
+        dl.log_inject(session, project, "prompt", 0, [{"id": "doc:" + f.split(" — ")[0], "section": "pointers"} for f in found])
+        return "\nDocs that may hold the answer (pointers only; open before acting):\n" + "\n".join(found)
     except Exception:
         return ""
 
@@ -186,6 +216,20 @@ def queued(state):
 def drain_queue(vault, state):
     """Worker: capture transcripts, sync Markdown, run jobs. Acknowledges queued events only after a clean sync."""
     state, pending = Path(state), queued(state)
+    for path in list(pending):  # a poison event is set aside with a trace so it cannot block the ones behind it
+        try:
+            if not isinstance(json.loads(path.read_text(encoding="utf-8")), dict):
+                raise ValueError("event is not an object")
+        except FileNotFoundError:
+            pending.remove(path)
+        except (OSError, ValueError) as exc:
+            note_error(state, exc, quarantined=path.name)
+            os.makedirs(state / "hook-bad", exist_ok=True)
+            try:
+                os.replace(path, state / "hook-bad" / path.name)
+            except FileNotFoundError:
+                pass
+            pending.remove(path)
     fail = {"processed": 0, "failed": len(pending), "pending": len(pending)}
     try:
         from memrove_v3_sync import SyncEngine
@@ -224,6 +268,19 @@ def drain_queue(vault, state):
                 _model_jobs(engine, vault, state, events)
             except Exception as exc:  # the model jobs are best effort
                 queue.record_error(state, "jobs", exc)
+        if any(e.get("event") == "SessionEnd" for e in events):
+            try:  # set point with an outflow: an over-limit companion file is archived verbatim, then trimmed
+                from memrove_v3_compact import compact
+                compact(vault, state)
+            except Exception as exc:  # best effort; the doctor still reports an over-limit file
+                queue.record_error(state, "compact", exc)
+        if any(e.get("event") == "SessionEnd" for e in events):
+            try:  # executable memory: re-run the checks of this session's projects; results are cached, nothing is superseded
+                from memrove_v3_checks import run_all
+                from memrove_v3_project import project_name
+                run_all(engine.store, state, {project_name(e["cwd"], state, vault) for e in events if e.get("event") == "SessionEnd" and e.get("cwd")})
+            except Exception as exc:  # best effort
+                queue.record_error(state, "checks", exc)
         from memrove_v3_secrets import health
         result["secrets_redacted"] = health(state)["total"]
     except Exception as exc:
@@ -235,6 +292,44 @@ def drain_queue(vault, state):
         return fail
     state.joinpath("hook-error.json").unlink(missing_ok=True)
     return {"processed": acknowledge(state, pending), "failed": 0, "pending": len(queued(state))}
+
+
+def single_flight(state):
+    """Non-blocking exclusive lock on <state>/hook-worker.lock. -> open file (keep it alive), or None when a worker already runs."""
+    os.makedirs(state, exist_ok=True)
+    lock = open(Path(state) / "hook-worker.lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock
+    except OSError:
+        lock.close()
+        return None
+
+
+def run_worker(vault, state):
+    """One heavy worker per state dir. A loser exits at once: its event is already in hook-queue/, and the holder
+    re-drains until the queue is empty or a round makes no progress. After releasing, the queue is looked at again so
+    an event that arrived between the last drain and the release is never stranded."""
+    outcome = {"processed": 0, "failed": 0, "pending": 0}
+    while True:
+        lock = single_flight(state)
+        if lock is None:
+            return dict(outcome, deferred=True)
+        gained = 0
+        try:
+            time.sleep(float(os.environ.get("MEMROVE_V3_TEST_HOLD", 0)))  # test knob: makes a short drain overlap its rivals
+            while True:
+                result = drain_queue(vault, state)
+                gained += result["processed"]
+                outcome["failed"], outcome["pending"] = result["failed"], result["pending"]
+                if result["failed"] or not result["pending"] or not result["processed"]:
+                    break
+        finally:
+            lock.close()
+        outcome["processed"] += gained
+        if not gained or not queued(state):  # no progress: a systemic failure, retrying would spin
+            break
+    return outcome
 
 
 def recall_hook(state, payload):
@@ -265,8 +360,51 @@ def health_warning(state):
     return "" if sync.get("status") in ("ok", "succeeded", "synced") else "Memory sync needs attention; run the doctor and check the current sources.\n"
 
 
-def session_notice(state, payload):
-    """Text for SessionStart: heartbeat line plus the pull-memory instruction for this start source."""
+def claude_md_warning(path=None):
+    """One line when the user's CLAUDE.md is over a byte budget (MEMROVE_CLAUDE_MD_BUDGET, default 7200). Never edits it."""
+    try:
+        budget = int(os.environ.get("MEMROVE_CLAUDE_MD_BUDGET") or 7200)
+        over = Path(path or Path.home() / ".claude" / "CLAUDE.md").stat().st_size - budget
+    except (OSError, ValueError):
+        return ""
+    return f"CLAUDE.md is {over} bytes over budget: convert a rule to a check or remove one\n" if over > 0 else ""
+
+
+TAIL_CAP, TAIL_MSG, TAIL_READ, CONTEXT_CAP = 6000, 700, 8 << 20, 9800  # recent-words block, per message, transcript bytes read, SessionStart text (host cap 10000)
+
+
+def recent_words(path, budget=TAIL_CAP, each=TAIL_MSG):
+    """The owner's last typed prompts of this session, oldest first, verbatim, each cut to `each` chars, newest kept when over `budget`. '' when none."""
+    from memrove_v3_capture import has_secret, user_text
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            f.seek(max(0, size - TAIL_READ))
+            lines = f.read().decode("utf-8", "replace").splitlines()[1 if size > TAIL_READ else 0:]
+    except OSError:
+        return ""
+    head, picked, used = "your recent words in this session (verbatim, oldest first; the compaction summary is lossy, these are not):\n", [], 0
+    for ln in reversed(lines):
+        try:
+            rec = json.loads(ln)
+            text = user_text(rec)
+        except ValueError:
+            continue
+        origin = rec.get("origin")
+        if (not text or (origin.get("kind") if isinstance(origin, dict) else origin) in AUTOMATED_ORIGINS
+                or text.startswith(AUTOMATED_PREFIXES + ("This session is being continued",)) or has_secret(text)):
+            continue
+        item = "- " + (text if len(text) <= each else text[:each] + f" [cut: {len(text) - each} more chars]") + "\n"
+        if used + len(item) + len(head) > budget:
+            break
+        picked.append(item)
+        used += len(item)
+    return head + "".join(reversed(picked)) if picked else ""
+
+
+def session_notice(state, payload, reserve=0):
+    """Text for SessionStart: heartbeat line plus the pull-memory instruction for this start source.
+    `reserve` = chars the caller appends after; on compact the owner's recent words come before the heads view and the whole stays under CONTEXT_CAP."""
     from memrove_v3_heartbeat import line
     notice, source = line(state), payload.get("source")
     if source in ("startup", "compact"):
@@ -278,8 +416,21 @@ def session_notice(state, payload):
     elif source in ("resume", "clear"):
         from memrove_v3_jit import RULE
         notice += RULE + "\n"
+    try:
+        from memrove_v3_checks import notice as stale_notice
+        notice += stale_notice(state)
+    except Exception:  # a broken cache never costs the start notice
+        pass
+    if source == "compact" and payload.get("transcript_path"):
+        try:
+            notice += recent_words(payload["transcript_path"], min(TAIL_CAP, CONTEXT_CAP - reserve - len(notice)))
+        except Exception:  # the tail never costs the start notice
+            pass
+    if source != "compact":  # heads are pull-able (memrove search); only a compaction loses context they help restore
+        return notice
     from memrove_v3_heads import start_view  # the project's newest topic heads, inside the same view
-    return notice + start_view(state, payload.get("cwd") or ".")
+    heads = start_view(state, payload.get("cwd") or ".")
+    return notice + (heads if len(notice) + len(heads) + reserve <= CONTEXT_CAP else "")
 
 
 def spawn_worker(vault, state, harness):
@@ -315,7 +466,7 @@ def main():
         if args.worker and not read(vault)["auto_sync"]:
             print(json.dumps({"processed": 0, "failed": 0, "paused": True}))
             return
-        outcome = drain_queue(vault, state)
+        outcome = run_worker(vault, state) if args.worker else drain_queue(vault, state)
         print(json.dumps(outcome))
         raise SystemExit(1 if outcome["failed"] else 0)
     event, notice = args.event, ""
@@ -324,6 +475,10 @@ def main():
         event = payload["hook_event_name"] = payload.get("hook_event_name", args.event)
         if (event not in EVENTS or os.environ.get("MEMROVE_V3_INTERNAL") or os.environ.get("MEMROVE_V3_SKIP") == "1"
                 or os.environ.get("MEMROVE_INVOKED_BY") or payload.get("no_memory") is True or skip_session(payload)):
+            print("{}")
+            return
+        read_only = headless_recall() and is_sdk(payload)  # reaching here with an sdk run means the flag let it through
+        if read_only and event not in ("SessionStart", "UserPromptSubmit"):
             print("{}")
             return
         if event == "UserPromptSubmit" and args.global_mode and args.harness == "claude" and not args.metadata_only:
@@ -335,16 +490,28 @@ def main():
             return
         if not args.metadata_only:
             if event == "SessionStart":
-                notice = session_notice(state, payload) + health_warning(state)
+                notice = health_warning(state) + claude_md_warning()
                 if args.harness == "claude":
                     try:  # standing rules are pushed text (a rule works by being in context)
                         from memrove_v3_rules import block as rules_block
                         from memrove_v3_project import project_name
-                        notice += rules_block(state, project_name(payload.get("cwd"), state, vault))
+                        notice += rules_block(state, project_name(payload.get("cwd"), state, vault), cwd=payload.get("cwd"))
                     except Exception:
                         pass
+                    try:  # the handoff card of the project's last session
+                        from memrove_v3_card import block as card_block
+                        from memrove_v3_project import project_name
+                        notice += card_block(state, project_name(payload.get("cwd"), state, vault))
+                        from memrove_v3_card import PROTOCOL
+                        notice += PROTOCOL
+                    except Exception:
+                        pass
+                notice = session_notice(state, payload, reserve=len(notice)) + notice
             elif event == "UserPromptSubmit":
                 notice = pastref_line(payload, state)
+        if read_only:
+            print(json.dumps(output_context(event, notice)) if notice else "{}")
+            return
         settings = read(vault)
         if settings["auto_sync"]:  # manual profile: no queueing, no worker
             enqueue_event(vault, state, payload, args.harness)

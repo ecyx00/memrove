@@ -168,6 +168,15 @@ class LogTest(Base):
 
 
 class IngestTest(Base):
+    def test_same_transcript_via_symlinked_dir_is_logged_once(self):
+        home, _ = fake_home(self.tmp)
+        projects = home / '.claude/projects'
+        once = Path(tempfile.mkdtemp(dir=self.tmp)) / 'once'
+        chatlog.ingest(once, home)
+        (projects / '-y').symlink_to(projects / '-x')
+        chatlog.ingest(self.state, home)
+        self.assertEqual(chatlog.count(self.state), chatlog.count(once))
+
     def test_sources_order_filters_redaction_cursors(self):
         home, s1 = fake_home(self.tmp)
         stats = chatlog.ingest(self.state, home)
@@ -816,6 +825,21 @@ class OptOutAndSearch(Base):
         with chatlog.lock(self.state):  # the skipped files are read once, not re-read every turn
             self.assertEqual(chatlog.ingest(self.state, home)['new'], 0)
 
+    def test_ingest_skips_headless_runs_by_entrypoint_not_by_folder(self):
+        home = self.tmp / 'h'
+        cwd = self.tmp / 'proj'
+        cwd.mkdir()
+        ts = '2026-10-07T10:00:00+00:00'
+
+        def rec(kind, uid, entry, text):
+            m = {'role': kind, 'content': text if kind == 'user' else [{'type': 'text', 'text': text}]}
+            return json.dumps({'type': kind, 'uuid': uid, 'timestamp': ts, 'cwd': str(cwd), 'entrypoint': entry, 'message': m})
+        (self.project(home, 'a') / 's.jsonl').write_text('\n'.join([rec('user', 'u1', 'sdk-cli', 'machine prompt'), rec('assistant', 'a1', 'sdk-cli', 'machine reply')]) + '\n')
+        (self.project(home, 'b') / 's.jsonl').write_text('\n'.join([rec('user', 'u2', 'cli', 'owner prompt'), rec('assistant', 'a2', 'cli', 'owner reply')]) + '\n')
+        with chatlog.lock(self.state):
+            chatlog.ingest(self.state, home)
+        self.assertEqual(sorted(m['text'] for m in chatlog.messages(self.state)), ['owner prompt', 'owner reply'])
+
     def test_search_finds_turkish_forms_incrementally(self):
         import memrove_v3_chatsearch as cs
         chatlog.append(self.state, [{'kind': 'user', 'text': t, 'date': '2026-10-07T10:00:00+00:00'} for t in (
@@ -890,6 +914,17 @@ class OptOutAndSearch(Base):
         self.assertIn('|decision|zebra cache is back', out)
         self.assertEqual([i for i in ids(cs.search(self.state, 'zebra cache', until='2026-10-06T09:00')) if i.startswith('rec:')], ['rec:obs-old', 'rec:q-auto'])  # a datetime T excludes its own day; the successor is not yet valid
         self.assertEqual(sorted(i for i in ids(cs.search(self.state, 'zebra cache')) if i.startswith('rec:')), ['rec:obs-late', 'rec:obs-new'])
+
+    def test_field_cap_applies_to_wiki_records_only(self):
+        import sqlite3
+        import memrove_v3_chatsearch as cs
+        db = sqlite3.connect(self.state / 'memory.sqlite3')
+        db.execute('CREATE TABLE records(id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        rec = lambda i, src: (i, json.dumps({'kind': 'note', 'status': 'active', 'source': src, 'title': 'filler', 'text': 'filler ' * 1000 + 'quokka'}))
+        db.executemany('INSERT INTO records VALUES (?,?)', [rec('obs-a', 'notes/observed/note/a.md'), rec('w-a', 'wiki/_concepts/a.md')])
+        db.commit()
+        db.close()
+        self.assertEqual([r[1][0] for r in cs.records(self.state, 'quokka')], ['rec:obs-a'])  # past the 3000-char cap only the owner record matches
 
 
 if __name__ == '__main__':

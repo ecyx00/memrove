@@ -4,7 +4,7 @@ One batched call per job per SessionEnd/PreCompact. Pure text -> JSON: `--tools 
 Gates: MEMROVE_NO_LLM=1, `.memrove/no-llm` (project or vault), daily cap, recursion guard (MEMROVE_INVOKED_BY).
 Tests replace `RUNNER`; nothing here imports the real CLI at module load.
 """
-from datetime import date
+from datetime import date, datetime
 import hashlib
 import json
 import os
@@ -251,19 +251,23 @@ def _newest(rows, n):
 def judge_quotes(engine, vault, state, root=None):
     """J1 via the System-One evaluator: unassessed user quotes and J2-inferred decisions/rejections -> assessments.j1 (advisory),
     one batched call. Policy lives in _j1_batch. Returns assessed count."""
+    import memrove_v3_evaluator as ev
+    from memrove_v3_trust import egress_of
     with engine.store._connect() as db:
-        quotes = _records(db, _J1_QUOTES)
+        quotes = [r for r in _records(db, _J1_QUOTES) if ev.visible(egress_of(r))]  # blocked ones would take MAX_J1 slots and be refused every run
         live = [r for r in quotes if not str(r.get("imported_from") or "").endswith("-session")]
         past = [r for r in quotes if str(r.get("imported_from") or "").endswith("-session")]
         # imports from past sessions only fill what live quotes leave of the batch: they never delay judging a live one
-        rows = _newest(live, MAX_J1) + _newest(past, max(0, MAX_J1 - len(live))) + _newest(_records(db, _J1_INFERRED), MAX_J1)
+        rows = _newest(live, MAX_J1) + _newest(past, max(0, MAX_J1 - len(live))) + _newest([r for r in _records(db, _J1_INFERRED) if ev.visible(egress_of(r))], MAX_J1)
     return len(_j1_batch(engine, vault, state, root, rows)[0]) if rows else 0
 
 
 def judge_inferred(engine, vault, state, root=None, limit=MAX_J1, dry_run=False):
     """One-off pass over the live store: unassessed J2-inferred decisions/rejections -> j1 rubric. -> {assessed, dropped, pending}"""
+    import memrove_v3_evaluator as ev
+    from memrove_v3_trust import egress_of
     with engine.store._connect() as db:
-        rows = _newest(_records(db, _J1_INFERRED), 10 ** 9)
+        rows = _newest([r for r in _records(db, _J1_INFERRED) if ev.visible(egress_of(r))], 10 ** 9)
     if dry_run or not rows:
         return {"assessed": 0, "dropped": 0, "pending": len(rows)}
     stored, dropped = _j1_batch(engine, vault, state, root, rows[:limit])
@@ -280,7 +284,7 @@ def judge_lessons(engine, vault, state, root=None, redo=False, limit=MAX_J1, dry
     with engine.store._connect() as db:
         rows = _records(db, "json_extract(payload,'$.kind')='lesson' AND coalesce(json_extract(payload,'$.status'),'') NOT IN ('dropped_llm','deleted_by_user','source_missing','retired')"
                             + ("" if redo else " AND json_extract(payload,'$.assessments.lesson_reusable') IS NULL"))
-    rows = sorted(rows, key=lambda r: str(r.get("updated_at", "")), reverse=True)
+    rows = sorted((r for r in rows if ev.visible(egress_of(r))), key=lambda r: str(r.get("updated_at", "")), reverse=True)  # blocked ones would head-of-line block the batch
     batch = rows[:limit]
     if dry_run or not batch:
         return {"assessed": 0, "dropped": 0, "pending": len(rows)}
@@ -317,7 +321,7 @@ def reassess(engine, vault, state, root=None, limit=MAX_REASSESS):
     import memrove_v3_capture as cap
     from memrove_v3 import _tokens
     from memrove_v3_projections import update_record
-    from memrove_v3_trust import egress_of
+    from memrove_v3_trust import combine_egress, egress_of
     ks = ",".join("'%s'" % k for k in REASSESS_KINDS)
     where = f"json_extract(payload,'$.kind') IN ({ks}) AND coalesce(json_extract(payload,'$.status'),'') IN ('active','')"
     with engine.store._connect() as db:
@@ -327,13 +331,14 @@ def reassess(engine, vault, state, root=None, limit=MAX_REASSESS):
     for n in news:
         mine = _tokens(_match_text(n)) - _tokens(cap.OPPOSE_CUES)
         mine_pairs = [(n, o) for o in recs if o.get("project") != n.get("project") and not o.get("reassess")
-                      and str(o.get("valid_from", "")) < str(n.get("valid_from", "")) and cap.same_subject(mine, n.get("key"), o, _match_text(o))]
+                      and str(o.get("valid_from", "")) < str(n.get("valid_from", "")) and ev.visible(egress_of(o)) and ev.visible(egress_of(n))
+                      and cap.same_subject(mine, n.get("key"), o, _match_text(o))]
         if len(pairs) + len(mine_pairs) > limit:
             break
         pairs += mine_pairs
         whole.append(n)
     items = [{"id": f"{n['id']}>{o['id']}", "text": _rec_text(n), "prev": _rec_text(o),
-              "egress": next((e for e in (egress_of(o), egress_of(n)) if e in ev.EGRESS_BLOCKED), "external_ok")} for n, o in pairs]
+              "egress": combine_egress([egress_of(o), egress_of(n)])} for n, o in pairs]
     results = {a["item_id"]: a for a in ev.evaluate(state, "reassess", items, vault=vault, root=root)} if items else {}
     today, flagged, failed = date.today().isoformat(), 0, set()
     for (n, o), it in zip(pairs, items):
@@ -456,6 +461,23 @@ def _save_cursors(path, cursors):
     os.replace(tmp, path)
 
 
+def _window_ev(ev, tp, cur, new):
+    """History import: stamp the window with the local date of its last transcript timestamp, not the session's start day."""
+    if not ev.get("history"):
+        return ev
+    day = None
+    with open(tp, "rb") as f:
+        f.seek(cur)
+        for raw in f.read(new - cur).splitlines():
+            try:
+                t = json.loads(raw).get("timestamp")
+                d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+                day = (d if d.tzinfo is None else d.astimezone()).date().isoformat()
+            except (ValueError, AttributeError, TypeError):
+                pass
+    return dict(ev, day=day) if day else ev
+
+
 def session_notes(engine, vault, state, events, root=None, budget=None):
     """J2: per queued session -> vault note under notes/sessions/ + proposed (origin=llm) decision/rejected records."""
     from memrove_v3_capture import key_of, has_secret, EXTRACTOR_VERSION
@@ -509,7 +531,7 @@ def session_notes(engine, vault, state, events, root=None, budget=None):
                     _save_cursors(cursors_file, cursors)
                     continue
                 break  # cursor stays and the tries are counted: this session retries next run, the other sessions go on now
-            _note(engine, state, data, text, ev, sid, tp, new, vault)
+            _note(engine, state, data, text, _window_ev(ev, tp, cur, new), sid, tp, new, vault)
             for twin in groups.get(tp) or [sid]:
                 cursors[twin] = new
             _save_cursors(cursors_file, cursors)  # a worker killed mid-run does not redo finished windows
@@ -796,7 +818,9 @@ def run_jobs(engine, vault, state, events, root=None):
         return out
     import memrove_v3_entities as entities
     try:
-        for name, fn in (("j2", lambda: session_notes(engine, vault, state, events, root)), ("j1", lambda: judge_quotes(engine, vault, state, root)),
+        for name, fn in (("j2", lambda: session_notes(engine, vault, state, events, root)),
+                         ("card", lambda: __import__("memrove_v3_card").draft_all(engine, vault, state, events, root)),  # handoff card, only for sessions with a decision cue
+                         ("j1", lambda: judge_quotes(engine, vault, state, root)),
                          ("restate", lambda: __import__("memrove_v3_restate").restate_rules(engine, vault, state, root)),  # one English sentence + scope per owner rule, for the pushed block
                          ("lessons", lambda: judge_lessons(engine, vault, state, root)),
                          ("reassess", lambda: reassess(engine, vault, state, root)),
@@ -829,12 +853,15 @@ def doctor(store, state=None):
         judged = _records(db, "json_extract(payload,'$.llm_verdict') IS NOT NULL OR json_extract(payload,'$.assessments.j1') IS NOT NULL")
     from memrove_v3_inject import j1_view
     judged = [(r, j1_view(r)) for r in judged]
-    agree = sum(1 for r, v in judged if is_durable(str(r.get("quote") or r.get("text"))) == v["durable"])
+    # diagnostic only: the regex is a Turkish suffix list built for owner quotes, so English J2 paraphrases are left out of it
+    own = [(r, v) for r, v in judged if r.get("origin_type") == "user_explicit" or r.get("verified_by") == "user_quote"]
+    agree = sum(1 for r, v in own if is_durable(str(r.get("quote") or r.get("text"))) == v["durable"])
     import memrove_v3_evaluator
 
     return {"enabled": not disabled(None), "calls_today": len(today), "daily_cap": queue.config(state)["daily_cap"], "queue": queue.status(state), "calls_total": len(log),
             "failed": sum(1 for e in log if not e.get("ok")), "cost_usd": round(sum(e.get("cost", 0) for e in log), 5),
             "avg_ms": int(sum(e.get("ms", 0) for e in log) / len(log)) if log else 0,
             "j1_judged": len(judged), "j1_drop_pct": round(100 * sum(1 for r, v in judged if v["drop"]) / len(judged), 1) if judged else 0.0,
-            "durable_agreement_pct": round(100 * agree / len(judged), 1) if judged else None,
+            "durable_agreement_pct": round(100 * agree / len(own), 1) if own else None, "durable_agreement_n": len(own),
+            "durable_agreement_note": "diagnostic: Turkish regex vs Haiku on owner quotes only; not a Haiku quality measure",
             "evaluator": memrove_v3_evaluator.metrics(state)}

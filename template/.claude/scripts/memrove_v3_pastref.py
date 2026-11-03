@@ -73,6 +73,8 @@ def hint(text, env=None):
 
 SESSION_GAP = 3600  # seconds
 MAX_OWNER = 1200  # longer "user" texts are pasted briefs or agent hand-offs, not the owner's own ask
+NOT_OWNER = re.compile(r"note offered by a side agent|\[subagent|<agent-message|^\s*(reply with|spawn exactly|nonce\s*[:=]|run `sleep|run these bash|run exactly this|quote verbatim|use (the \w+ subagent|taskcreate)|sendmessage to agent|in m\.py)|task[- ]notification|^\s*(\[system\b|<system|hook\b[^\n]{0,40}\boutput\b)", re.I)
+SLASH_CMD = re.compile(r"\s*/[\w:-]+(\s|$)")  # "/clear", not a path like "/Users/x.md"
 TOKEN = re.compile(r"[a-z0-9_]{3,}")
 
 
@@ -92,7 +94,9 @@ def owner_prompts(state, since=None):
             continue
         if r.get("kind") != "user" or r.get("src") not in ("claude", "codex") or not 8 <= len(t) <= MAX_OWNER:
             continue
-        if t.lstrip()[:1] in ("!", "<") or t.startswith(("claude ", "codex ")):  # shell lines, pasted harness blocks: not an ask
+        if NOT_OWNER.search(t[:200]):  # side-agent notes, hand-backs, task notifications arrive as "user" lines
+            continue
+        if t.lstrip()[:1] in ("!", "<") or SLASH_CMD.match(t) or t.startswith(("claude ", "codex ")):  # shell lines, pasted harness blocks: not an ask
             continue
         if since and r["date"][:10] < since:
             continue
@@ -100,13 +104,17 @@ def owner_prompts(state, since=None):
     return out
 
 
+SKILL_REF = re.compile(r"\[\$[^\]]*\]\([^)]*\)|\$[a-z][\w-]*")  # "[$skill](/path/SKILL.md)" and "$skill": template boilerplate, not content
+
+
 def tokens(text):
-    return TOKEN.findall(fold(text))
+    return TOKEN.findall(fold(SKILL_REF.sub(" ", text)))
 
 
-def rebrief_pairs(prompts, min_score=0.5, min_tokens=6, ):
+def rebrief_pairs(prompts, min_score=0.5, min_tokens=6, same_session=False):
     """For each prompt, its best earlier prompt from a DIFFERENT session. Score = BM25 of the new prompt against the earlier one,
-    divided by the earlier one's score against itself (so 1.0 = same words). Returns [(new_id, earlier_id, score)]."""
+    divided by the earlier one's score against itself (so 1.0 = same words). Returns [(new_id, earlier_id, score)].
+    same_session=True looks only inside the prompt's own session instead (an in-session near-repeat)."""
     docs = [(i, s, d, Counter(tokens(t))) for i, s, d, t in prompts]
     docs = [x for x in docs if sum(x[3].values()) >= min_tokens]
     n = len(docs)
@@ -124,7 +132,7 @@ def rebrief_pairs(prompts, min_score=0.5, min_tokens=6, ):
         acc = defaultdict(float)
         for w in tf:
             for e, sc in post[w]:
-                if e < j and docs[e][1] != s:
+                if e < j and (docs[e][1] == s) == same_session:
                     acc[e] += sc
         # normalise by the earlier doc's self-score and the new doc's, geometric mean (symmetric, bounded by ~1)
         cands = []
@@ -142,6 +150,47 @@ def _self(tf, idf, k1, b, avg):
     return sum(idf[w] * f * (k1 + 1) / (f + k1 * (1 - b + b * ln / avg)) for w, f in tf.items()) or 1e-9
 
 
+# Correction markers on folded text, picked from the owner's real prompts.
+CORRECTION = re.compile(
+    r"\b(hayir|yanlis|yanlisin|demistim|dememistim|dedim ya|anlamadin|anlamamissin|takildin|olmadi|olmamis|istemedim|istemiyorum bunu|"
+    r"sacmalama|hala (yok|olmuyor|ayni|yanlis|calismiyor|bozuk)|yine (de )?(yok|yanlis|ayni|hata|olmadi|bozuk|takildi)|yine mi|"
+    r"bunu degil|bu degil|dogru degil|kontrol etmedin|bakmadin|okumadin|unuttun|"
+    r"no[,.] (that|this|i|it|not)|that'?s (not|wrong)|wrong|i (said|told you|asked)|not what i|you (missed|forgot|ignored|didn'?t)|still (not|wrong|broken|fails|failing)|why did you)\b|again[?!]")
+
+
+def is_correction(text):
+    return bool(CORRECTION.search(fold(text or "")[:600]))
+
+
+def _numbered_template(a, b):
+    """Two prompts whose only difference is an id with digits ("Execute only T13.2" / "T13.3") are one template run twice."""
+    ids = lambda t: set(re.findall(r"\b[a-z]*\d[\w.]*", fold(t)))
+    return ids(a) != ids(b)
+
+
+def corrections(prompts, min_score=0.7):
+    """{prompt id: 'marker' | 'repeat'} for owner prompts that correct or re-ask the agent inside the same session."""
+    # Long prompts in one session are task templates ("Execute only T13.2 ..."), not the owner asking again: repeats need a short ask.
+    short = [x for x in prompts if len(x[3]) <= 400]
+    text = {i: t for i, s, d, t in short}
+    out = {i: "repeat" for i, e, _ in rebrief_pairs(short, min_score, same_session=True) if not _numbered_template(text[i], text[e])}
+    seen = set()  # a marker needs an earlier owner prompt in its session to correct
+    for i, s, d, t in prompts:
+        if s in seen and is_correction(t):
+            out[i] = "marker"
+        seen.add(s)
+    return out
+
+
+def corrections_weekly(prompts, found):
+    """{iso week: [prompts, marker corrections, rate, near-repeats]}; the rate is markers only (repeats are ~36% precise).
+    Every owner prompt counts in the denominator (corrections are often short)."""
+    week = {i: datetime.fromisoformat(d).strftime("%G-W%V") for i, s, d, t in prompts}
+    tot = Counter(week.values())
+    hit, rep = (Counter(week[i] for i, h in found.items() if h == k) for k in ("marker", "repeat"))
+    return {w: [tot[w], hit[w], round(hit[w] / tot[w], 3), rep[w]] for w in sorted(tot)}
+
+
 def weekly_rate(prompts, pairs):
     """{iso week: [prompts, re-briefs, rate]} over prompts long enough to be compared."""
     week = {i: datetime.fromisoformat(d).strftime("%G-W%V") for i, s, d, t in prompts}
@@ -150,12 +199,19 @@ def weekly_rate(prompts, pairs):
     return {w: [tot[w], hit[w], round(hit[w] / tot[w], 3)] for w in sorted(tot)}
 
 
-def rebrief_command(state, out="/tmp/e71-out/rebrief-pairs.jsonl", min_score=0.5, since=None):
+def rebrief_command(state, out="/tmp/e71-out/rebrief-pairs.jsonl", min_score=0.5, since=None, corr_out=None):  # in-session repeats use a stricter 0.7
     prompts = owner_prompts(state, since)
     pairs = rebrief_pairs(prompts, min_score)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         for new, old, sc in pairs:
             f.write(json.dumps({"new": new, "earlier": old, "score": sc}) + "\n")
+    found = corrections(prompts)
+    corr_out = corr_out or os.path.join(os.path.dirname(out) or ".", "corrections-sample.jsonl")
+    text = {i: t for i, s, d, t in prompts}
+    with open(corr_out, "w", encoding="utf-8") as f:
+        for i, how in sorted(found.items()):
+            f.write(json.dumps({"id": i, "how": how, "text": text[i][:300]}, ensure_ascii=False) + "\n")
     return json.dumps({"prompts": len(prompts), "pairs": len(pairs), "pairs_file": out,
-                       "weekly": weekly_rate(prompts, pairs)}, indent=2)
+                       "weekly": weekly_rate(prompts, pairs), "corrections": len(found), "corrections_by": dict(Counter(found.values())), "corrections_file": corr_out,
+                       "corrections_weekly": corrections_weekly(prompts, found)}, indent=2)

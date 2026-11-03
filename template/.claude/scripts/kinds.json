@@ -1,6 +1,7 @@
 {
   "task": {"observable": false, "scope": "project"},
   "session": {"observable": false, "scope": "project"},
+  "card": {"observable": false, "scope": "project"},
   "decision": {"observable": false, "scope": "project"},
   "rejected": {"observable": false, "scope": "project"},
   "lesson": {"observable": false, "scope": "project"},

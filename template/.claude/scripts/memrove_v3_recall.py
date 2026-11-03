@@ -210,7 +210,7 @@ def _line(s, limit):
     kind = r.get("kind")
     body = _body(r)
     sess = r.get("session") or ""
-    tail = f" (bkz. session {sess})" if sess else ""
+    tail = (f" [measured: {r['measured']}]" if r.get("measured") else "") + (f" (bkz. session {sess})" if sess else "")
     head = f"[other project: {r.get('project', '?')} · {_day(r)} · {'you' if s['user'] else 'inferred'}] {kind}: "
     from memrove_v3_inject import reassess_tag
     head += reassess_tag(r).lstrip() + " " if reassess_tag(r) else ""
@@ -419,6 +419,11 @@ def show(store, rid):
     if len(rows) != 1:
         raise ValueError(f"no unique record for {rid!r}")
     r = json.loads(rows[0][0])
-    keys = ("id", "kind", "project", "title", "text", "approach", "result", "situation", "why", "reuse", "evidence", "quote", "verified_by",
+    keys = ("id", "kind", "project", "title", "text", "approach", "result", "situation", "why", "measured", "check", "reuse", "evidence", "quote", "verified_by",
             "origin_type", "session", "updated_at", "valid_from", "created_at", "status")
-    return {k: r[k] for k in keys if r.get(k) not in (None, "", [], {})}
+    out = {k: r[k] for k in keys if r.get(k) not in (None, "", [], {})}
+    with store._connect() as db:  # links live only on the newer record; derive the old one's state, never store it
+        newer = [i for (i,) in db.execute("SELECT id FROM records WHERE id<>? AND EXISTS (SELECT 1 FROM json_each(payload,'$.supersedes') j WHERE j.value=?)", (r["id"], r["id"]))]
+    if newer:
+        out["status"], out["superseded_by"] = "superseded", newer
+    return out

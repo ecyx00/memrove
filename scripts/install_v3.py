@@ -83,7 +83,7 @@ def with_hooks(path, command, events, timeouts=None, jit=None):
             group["matcher"] = "Edit|Write|apply_patch"
         hooks.setdefault(event, []).append(group)
     for event, matcher in JIT_EVENTS if command and jit else ():
-        group = {"hooks": [{"type": "command", "command": jit, "timeout": 3}]}
+        group = {"hooks": [{"type": "command", "command": jit, "timeout": 9 if event == "SubagentStart" else 3}]}   # SubagentStart may wait up to 6 s for the Haiku selector
         if matcher:
             group["matcher"] = matcher
         hooks.setdefault(event, []).append(group)

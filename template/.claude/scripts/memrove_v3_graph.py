@@ -264,8 +264,49 @@ class Index:
         return out
 
 
-def candidates(index, node, k=15, other_min=5):
-    """About k candidate record ids for linking `node`: the best lexical matches, at least other_min from other projects when there are any."""
+EMB_K = 5      # candidate slots that go to vector similarity (a pair with no shared words)
+EMB_MIN = 0.30  # cosine floor for those (ponytail: static potion scale, tuned on the live copy)
+
+
+def emb_candidates(node, pool, vecs, skip=(), k=EMB_K):
+    """Top-k record ids by cosine to `node`, at least half from other projects; concepts and `skip` are left out."""
+    q = vecs.get(node['id'])
+    if q is None:
+        return []
+    ranked = sorted(((sum(map(float.__mul__, q, v)), i) for i, v in vecs.items() if i != node['id'] and i not in skip and i in pool and pool[i]['kind'] != 'concept'), reverse=True)
+    ranked = [x for x in ranked if x[0] >= EMB_MIN]
+    other = [x for x in ranked if pool[x[1]]['project'] != node['project']]
+    pick = other[:(k + 1) // 2]
+    pick += [x for x in ranked if x not in pick][:k - len(pick)]
+    return [i for _, i in sorted(pick, reverse=True)]
+
+
+def load_vecs(state, pool):
+    """{id: unit vector} for every non-concept node: the shared vector cache first, the rest embedded here. {} when no embedder loads (lexical only)."""
+    try:
+        import memrove_v3_embed as E
+        emb = E.get_embedder()
+        vecs = dict(E.VecStore(state, readonly=True).load(emb.name))
+        miss = [i for i, n in pool.items() if n['kind'] != 'concept' and i not in vecs]
+        for start in range(0, len(miss), 64):
+            part = miss[start:start + 64]
+            vecs.update(zip(part, emb.embed([(pool[i]['title'] + ' ' + pool[i]['text'])[:E.EMBED_CHARS] for i in part])))
+        return vecs
+    except Exception:
+        return {}
+
+
+def candidates(index, node, k=15, other_min=5, vecs=None):
+    """About k candidate record ids for linking `node`: the best lexical matches, at least other_min from other projects when there are any;
+    with `vecs`, EMB_K slots go to embedding neighbours the lexical pass missed."""
+    lex = _lex_candidates(index, node, k, other_min)
+    if not vecs:
+        return lex
+    extra = emb_candidates(node, index.nodes, vecs, skip=set(lex))
+    return lex[:k - len(extra)] + extra
+
+
+def _lex_candidates(index, node, k=15, other_min=5):
     ranked = index.score(node['title'] + ' ' + node.get('text', ''), exclude={node['id']}, concepts=False)
     same = [x for x in ranked if index.nodes[x[1]]['project'] == node['project']]
     other = [x for x in ranked if index.nodes[x[1]]['project'] != node['project']]
@@ -368,18 +409,46 @@ def _spend(state, tokens):
     f.write_text(json.dumps(u), encoding='utf-8')
 
 
-def _payload(batch, pool, index):
+def _pending_file(state):
+    return Path(state) / 'graph-pending.txt'
+
+
+def enqueue(state, rid):
+    """Write-time hook of `memrove remember`: one appended line, no model call. link_new links these first."""
+    with _pending_file(state).open('a', encoding='utf-8') as f:
+        f.write(rid + '\n')
+
+
+def pending(state):
+    try:
+        return list(dict.fromkeys(_pending_file(state).read_text(encoding='utf-8').split()))
+    except OSError:
+        return []
+
+
+def kick(vault, state, script):
+    """Start a detached `graph run --pending` unless the LLM is off. -> True when started."""
+    import memrove_v3_llm as llm
+    if llm.disabled(vault) or not pending(state):
+        return False
+    import subprocess
+    subprocess.Popen([sys.executable, str(script), '--vault', str(vault), '--state', str(state), 'graph', 'run', '--pending'], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
+    return True
+
+
+def _payload(batch, pool, index, vecs=None):
     items = []
     for n in batch:
         con = [i for _, i, _ in index.score(n['title'] + ' ' + n['text']) if i.startswith('concept:')][:12]
         con = con or sorted(i for i in pool if i.startswith('concept:'))[:12]
         items.append({'id': n['id'], 'project': n['project'], 'kind': n['kind'], 'text': (n['title'] + '. ' + n['text'])[:TEXT_CHARS] if n['text'] else n['title'],
-                      'candidates': [{'id': c, 'project': pool[c]['project'], 'kind': pool[c]['kind'], 'title': pool[c]['title'][:CAND_CHARS]} for c in candidates(index, n)],
+                      'candidates': [{'id': c, 'project': pool[c]['project'], 'kind': pool[c]['kind'], 'title': pool[c]['title'][:CAND_CHARS]} for c in candidates(index, n, vecs=vecs)],
                       'concepts': [{'id': c, 'name': pool[c]['title']} for c in con]})
     return items
 
 
-def apply_answer(db, items, data, model='haiku'):
+def apply_answer(db, items, data, model='haiku', job='j5'):
     """Validate the model's answer against what each node was shown and store the edges. -> (edges, concepts, refused)."""
     ensure(db)
     out = {x.get('id'): x for x in data.get('nodes', []) if isinstance(x, dict)} if isinstance(data, dict) else {}
@@ -387,7 +456,7 @@ def apply_answer(db, items, data, model='haiku'):
     for it in items:
         ans = out.get(it['id'])
         shown = {c['id'] for c in it['candidates']} | {c['id'] for c in it['concepts']}
-        prov = provenance('job:j5', 'model', model=model, job='j5')
+        prov = provenance('job:' + job, 'model', model=model, job=job)
         n_edges = 0
         for e in ((ans or {}).get('edges') or [])[:MAX_EDGES_PER_NODE]:  # more than that is noise, not judgment
             if not isinstance(e, dict):
@@ -415,28 +484,34 @@ def apply_answer(db, items, data, model='haiku'):
     return added, made, refused
 
 
-def link_new(engine, vault, state, root=None, limit=8, ids=None, budget=None, token_cap=None, dry_run=False):
+def link_new(engine, vault, state, root=None, limit=8, ids=None, budget=None, token_cap=None, dry_run=False, job='j5', max_cost=None, daily=True, pending_only=False):
     """J5: link nodes the graph has not seen yet, `limit` nodes per run, BATCH per call. The daily token estimate caps it.
-    -> {'nodes', 'calls', 'edges', 'concepts', 'refused', 'cost', 'tokens', 'stopped'}"""
+    Nodes queued by `remember` go first. job names the provenance (`undo <job>` removes its edges); daily=False swaps the daily token estimate for
+    token_cap per run, max_cost stops after the call that crosses it (dollars).
+    -> {'nodes', 'calls', 'edges', 'concepts', 'refused', 'cost', 'tokens', 'stopped', 'batches'}"""
     import memrove_v3_llm as llm
-    res = {'nodes': 0, 'calls': 0, 'edges': 0, 'concepts': 0, 'refused': 0, 'cost': 0.0, 'tokens': 0, 'stopped': ''}
+    res = {'batches': 0, 'nodes': 0, 'calls': 0, 'edges': 0, 'concepts': 0, 'refused': 0, 'cost': 0.0, 'tokens': 0, 'stopped': ''}
     with engine.store._connect() as db:
         ensure(db)
         pool = load_nodes(db, vault)
         seen = {r[0] for r in db.execute('SELECT id FROM graph_seen')}
     order = ids or sorted((i for i, n in pool.items() if n['kind'] != 'concept'), key=lambda i: (pool[i]['day'], i), reverse=True)
+    queued = [i for i in pending(state) if i not in seen]
+    order = queued if pending_only else queued + [i for i in order if i not in queued]
     todo = [i for i in order if i in pool and pool[i]['kind'] != 'concept' and (ids or i not in seen)][:limit]
     index = Index(pool)
+    vecs = load_vecs(state, pool) if todo else {}
     for start in range(0, len(todo), BATCH):
         batch = [pool[i] for i in todo[start:start + BATCH]]
-        items = _payload(batch, pool, index)
+        items = _payload(batch, pool, index, vecs)
         payload = json.dumps({'nodes': items}, ensure_ascii=False)
         est = (len(payload) + len(SYSTEM['j5'])) // 3 + 600
         if dry_run:
             res['tokens'] += est
             res['nodes'] += len(batch)
+            res['batches'] += 1
             continue
-        if tokens_left(state, token_cap) < est:
+        if (tokens_left(state, token_cap) if daily else (token_cap or DEFAULT_DAILY_TOKENS) - res['tokens']) < est:
             res['stopped'] = 'token-cap'
             break
         status = {}
@@ -444,16 +519,18 @@ def link_new(engine, vault, state, root=None, limit=8, ids=None, budget=None, to
         if status.get('reason') in ('disabled', 'budget', 'cap', 'reserved'):
             res['stopped'] = status['reason']
             break
-        _spend(state, est)
+        if daily:
+            _spend(state, est)
         res['tokens'] += est
         res['calls'] += 1
         if data is None:
             res['stopped'] = 'failed'
             continue
         with engine.store._connect() as db:
-            a, m, rf = apply_answer(db, items, data)
+            a, m, rf = apply_answer(db, items, data, job=job)
             concepts = load(db)[0]
         res['nodes'] += len(batch)
+        res['batches'] += 1
         res['edges'] += a
         res['concepts'] += m
         res['refused'] += rf
@@ -462,9 +539,28 @@ def link_new(engine, vault, state, root=None, limit=8, ids=None, budget=None, to
             pool[cid] = {'id': cid, 'kind': 'concept', 'project': '', 'title': c['name'], 'text': c['why'], 'day': '', 'source': '', 'status': None, 'supersedes': []}
         if new:
             index = Index(pool)
+        if max_cost and budget and budget.get('cost', 0.0) >= max_cost:
+            res['stopped'] = 'cost-cap'
+            break
     if budget:
         res['cost'] = round(budget.get('cost', 0.0), 4)
+    if not dry_run and _pending_file(state).exists():  # drop what has been judged
+        with engine.store._connect() as db:
+            seen = {r[0] for r in db.execute('SELECT id FROM graph_seen')}
+        left = [i for i in pending(state) if i not in seen]
+        _pending_file(state).write_text(''.join(i + '\n' for i in left), encoding='utf-8')
     return res
+
+
+def undo(engine, job):
+    """Remove every edge and concept written by `job`, and mark their source nodes unseen again. -> (edges, concepts)."""
+    with engine.store._connect() as db:
+        ensure(db)
+        srcs = [r[0] for r in db.execute("SELECT DISTINCT src FROM graph_edges WHERE json_extract(prov,'$.job')=?", (job,))]
+        e = db.execute("DELETE FROM graph_edges WHERE json_extract(prov,'$.job')=?", (job,)).rowcount
+        c = db.execute("DELETE FROM graph_nodes WHERE json_extract(prov,'$.job')=?", (job,)).rowcount
+        db.executemany('DELETE FROM graph_seen WHERE id=?', [(i,) for i in srcs])
+    return e, c
 
 
 # ---------------------------------------------------------------- agent queries (compact output)
@@ -599,6 +695,15 @@ def related(db, vault, text, limit=1500):
                   for i, hit in picked], limit)
 
 
+def _avg_cost(state, default=0.0035):
+    """Mean dollars of a logged J5 call (llm-log.jsonl), for the dry-run estimate."""
+    try:
+        c = [e['cost'] for e in map(json.loads, (Path(state) / 'llm-log.jsonl').read_text(encoding='utf-8').splitlines()[-2000:]) if e.get('job') == 'j5' and e.get('ok') and e.get('cost')]
+        return sum(c) / len(c) if c else default
+    except (OSError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------- CLI
 def main(argv, vault, state, open_store, open_engine):
     """memrove graph neighbors|hub|related|link|concept|run -> text on stdout, exit code.
@@ -628,13 +733,45 @@ def main(argv, vault, state, open_store, open_engine):
     run.add_argument('--tokens', type=int, default=None, help='token cap for this run')
     run.add_argument('--dry-run', action='store_true')
     run.add_argument('--ids', nargs='*')
+    run.add_argument('--pending', action='store_true', help='only the records `remember` queued; skips quietly when another worker holds the lock')
+    bf = sub.add_parser('backfill', help='link every unlinked record in batches under a token and dollar cap; resumable (graph_seen), idempotent')
+    bf.add_argument('--tokens', type=int, required=True, help='estimated token cap for this run')
+    bf.add_argument('--max-usd', type=float, required=True, help='stop after the call that crosses this cost')
+    bf.add_argument('--limit', type=int, default=100000, help='most nodes to link in this run')
+    bf.add_argument('--job', default=None, help='provenance job id (default backfill-<UTC stamp>); reuse it to resume under the same id')
+    bf.add_argument('--dry-run', action='store_true')
+    ud = sub.add_parser('undo', help='delete the edges and concepts one job wrote (j5, backfill-...)')
+    ud.add_argument('job')
     args = ap.parse_args(argv)
     if args.cmd in ('neighbors', 'hub', 'related'):
         with open_store(True)._connect() as db:
             print({'neighbors': lambda: neighbors(db, vault, args.target, args.hops, args.max_bytes), 'hub': lambda: hub(db, vault, args.target, args.max_bytes),
                    'related': lambda: related(db, vault, args.target, args.max_bytes)}[args.cmd]())
         return 0
+    if args.cmd == 'undo':
+        print(json.dumps(dict(zip(('edges', 'concepts'), undo(open_engine(), args.job)))))
+        return 0
+    if args.cmd == 'backfill':
+        engine = open_engine()
+        job = args.job or 'backfill-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+        budget = {'left': 10**6, 'calls': 0, 'cost': 0.0}
+        res = link_new(engine, vault, state, limit=args.limit, budget=budget, token_cap=args.tokens, dry_run=args.dry_run, job=job, max_cost=args.max_usd, daily=False)
+        if args.dry_run:
+            res['est_cost_usd'] = round(res['batches'] * _avg_cost(state), 3)
+        res['job'] = job
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
     if args.cmd == 'run':
+        if args.pending:
+            import memrove_v3_llm as llm
+            lock = llm._locked(state)
+            if not lock:
+                return 0  # the running worker links the queue first
+            try:
+                print(json.dumps(link_new(open_engine(), vault, state, pending_only=True), ensure_ascii=False))
+            finally:
+                lock.unlink(missing_ok=True)
+            return 0
         engine = open_engine()
         budget = {'left': args.calls, 'calls': 0, 'cost': 0.0} if args.calls else None
         print(json.dumps(link_new(engine, vault, state, limit=args.limit, ids=args.ids, budget=budget, token_cap=args.tokens, dry_run=args.dry_run), ensure_ascii=False))

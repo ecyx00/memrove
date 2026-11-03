@@ -87,7 +87,6 @@ RUBRICS = {
     },
 }
 BUDGET = None  # a one-off backfill sets {"left": n, "calls": 0, "cost": 0.0}: its calls then bypass the daily cap (llm.call budget)
-EGRESS_BLOCKED = ("device_only", "self_hosted")  # remote providers never see these
 
 
 def _check(q, v):
@@ -140,10 +139,25 @@ def _none(state, rubric, items, vault=None, root=None):
 
 
 PROVIDERS = {"haiku": (True, _haiku), "jev": (True, _jev), "none": (False, _none)}  # name -> (remote, fn)
+PAID = {"haiku"}  # remote providers on a paid plan; any other remote provider (jev, one added later) counts as a free tier
 
 
 def provider_name(provider=None):
     return provider or os.environ.get("MEMROVE_EVALUATOR") or "haiku"
+
+
+def visible(egress, provider=None):
+    """May the provider see an item with this egress label? Candidate selection uses it so blocked items are neither refused nor logged.
+    A missing or unknown label counts as device_only (trust.visible_to)."""
+    from memrove_v3_trust import visible_to
+    return visible_to(egress, tier(provider_name(provider)))
+
+
+def tier(name):
+    """Reader tier of a provider: local (never leaves the machine), paid (in PAID) or free (any other remote provider)."""
+    if not PROVIDERS.get(name, PROVIDERS["none"])[0]:
+        return "local"
+    return "paid" if name in PAID else "free"
 
 
 def _key(item, rubric_id, version, provider):
@@ -159,7 +173,7 @@ def evaluate(state, rubric_id, items, provider=None, vault=None, root=None):
     mk = lambda it, answers, st, ms=0: {"item_id": it["id"], "rubric_id": rubric_id, "rubric_version": rubric["version"], "provider": name,
                                        "answers": answers, "state": st, "latency_ms": ms, "revision": it.get("revision")}
     for it in items:
-        if remote and it.get("egress", "external_ok") in EGRESS_BLOCKED:
+        if not visible(it.get("egress"), name):
             out[it["id"]] = mk(it, {}, "not_assessed")
             _log(state, name, rubric_id, "egress_refused")
             continue
@@ -222,11 +236,17 @@ def apply(engine, state, assessments):
     return done
 
 
-def metrics(state):
-    """Per provider: calls, items, cache hit rate, p50/p95 call latency ms, not_assessed rate, stale_revision count, egress refusals."""
+WINDOW_DAYS = 7
+
+
+def metrics(state, window_days=WINDOW_DAYS):
+    """Per provider, over the last window_days of the log: calls, items attempted, cache hit rate, p50/p95 call latency ms,
+    not_assessed rate (egress refusals excluded from numerator and denominator), stale_revision count, egress_refused (window) and
+    egress_refused_total (lifetime). Refusals are a privacy outcome, not an evaluator failure."""
     try:
         with _db(state) as db:
-            rows = db.execute("SELECT provider, event, n, ms FROM log").fetchall()
+            rows = db.execute("SELECT provider, event, n, ms FROM log WHERE ts >= ?", (time.time() - window_days * 86400,)).fetchall()
+            totals = dict(db.execute("SELECT provider, count(*) FROM log WHERE event='egress_refused' GROUP BY provider").fetchall())
     except sqlite3.Error:
         return {}
     out = {}
@@ -235,9 +255,10 @@ def metrics(state):
         ev = [r for r in rows if r[0] == p]
         count = lambda e: sum(1 for r in ev if r[1] == e)
         calls, hits = [r for r in ev if r[1] == "call"], count("hit")
-        items = count("item_assessed") + count("item_unclear") + count("item_not_assessed")
+        refused = count("egress_refused")
+        items = count("item_assessed") + count("item_unclear") + count("item_not_assessed") - refused
         out[p] = {"calls": len(calls), "items": items, "cache_hit_rate": round(hits / items, 3) if items else 0.0,
                   "p50_ms": pct([r[3] for r in calls], 0.5), "p95_ms": pct([r[3] for r in calls], 0.95),
-                  "not_assessed_rate": round(count("item_not_assessed") / items, 3) if items else 0.0,
-                  "stale_revision": count("stale_revision"), "egress_refused": count("egress_refused")}
+                  "not_assessed_rate": round((count("item_not_assessed") - refused) / items, 3) if items else 0.0,
+                  "stale_revision": count("stale_revision"), "egress_refused": refused, "egress_refused_total": totals.get(p, 0), "window_days": window_days}
     return out

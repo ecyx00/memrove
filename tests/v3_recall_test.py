@@ -216,6 +216,18 @@ class HookTest(Base):
         self.assertEqual(json.loads(self.run_hook(base, env={'MEMROVE_NO_RECALL': '1'})), {})
         self.assertEqual(json.loads(self.run_hook(dict(base, entrypoint='sdk-cli'))), {})
 
+    def test_headless_recall_flag_injects_for_sdk_and_writes_no_chat_row(self):
+        self.add('l1', **LESSON)
+        sdk = {'prompt': PROMPT, 'session_id': 'x', 'cwd': str(self.repo), 'entrypoint': 'sdk-cli'}
+        on = {'MEMROVE_HEADLESS_RECALL': '1'}
+        out = json.loads(self.run_hook(sdk, env=on))
+        self.assertIn('<memrove-recall', out['hookSpecificOutput']['additionalContext'])
+        self.assertEqual(json.loads(self.run_hook(sdk)), {})  # flag off: unchanged
+        self.assertEqual(json.loads(self.run_hook(sdk, env=on, event='Stop')), {})  # write-side events stay silent
+        self.run_hook(dict(sdk, source='startup'), env=on, event='SessionStart')
+        self.assertFalse(list(self.state.glob('hook-queue/*')))  # nothing queued for the worker
+        self.assertFalse((self.state / 'chatlog').exists())  # no chat row, no tree
+
     def test_fail_open_on_exception(self):
         (self.state / 'memory.sqlite3').write_bytes(b'not a database')
         with patch.object(recall, 'recall', side_effect=RuntimeError('boom')):

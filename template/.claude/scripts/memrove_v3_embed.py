@@ -360,10 +360,57 @@ def refresh(state, spec=None, limit=None):
         records = [(rid, _json.loads(payload)) for payload, _, rid in _load(StateStore(state))]
         out = VecStore(state).refresh(records, embedder, limit)
         if cfg.get("cascade") and not isinstance(embedder, DaemonEmbedder) and ensure_daemon(cfg.get("daemon_python"), cfg.get("daemon_idle", 600)):
-            out["l2"] = VecStore(state).refresh(records, DaemonEmbedder(), limit or cfg.get("l2_limit", 128))
+            out["l2"] = VecStore(state).refresh(records + _search_only(state, records) + owner_messages(state), DaemonEmbedder(), limit or cfg.get("l2_limit", 128))
         return out
     except Exception as exc:
         return {"error": type(exc).__name__}
+
+
+PASTED = re.compile(r"^\s*(?:<|spawn|launch|execute only|use the agent tool|do these \d|you are (?:the|an?) |sendmessage|run (?:the |`)|do not edit any file|reply with )|\[Subagent hand-back\]|```|\n\s*(?:[-*#]|\d+[.)]) ", re.I)
+MAX_MSG = 1000   # shortcut: the chat index does not tag the author, so pasted briefs, logs and hand-backs are recognised by shape. Upgrade when it does.
+
+
+def owner_text(text):
+    """True for a 'user' chat message that is the owner's own words (short chat prose), not a pasted prompt, brief, log or hand-back."""
+    return len(text) <= MAX_MSG and text.count("\n") < 8 and not PASTED.search(text)
+
+
+SKILL_TAGS = re.compile(r"\[\$?[\w-]+\]\([^)]*\)|\[Image #\d+\]|(?<!\w)[$/][a-z][\w-]*(?=\s|,|$)|&#x20;|https?://\S+")
+
+
+def clean_message(text):
+    """The message without skill tags, image markers and links: they say nothing about the idea and pull every message toward the same neighbours."""
+    return " ".join(SKILL_TAGS.sub(" ", text).split())
+
+
+def owner_messages(state):
+    """[("msg:<id>", {"text": ...})]: the owner's chat messages for the dense lane of subagent recall (vectors in the EG2 store, built at sync time)."""
+    path = Path(state) / "chatlog" / "search.db"
+    if not path.is_file():
+        return []
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        out = [(f"msg:{i}", {"text": clean_message(t)}) for i, t in db.execute("SELECT id, text FROM m WHERE kind = 'user'") if owner_text(t)]
+        return [(k, r) for k, r in out if len(r["text"]) >= 25 and len(r["text"].split()) >= 4]   # '/compact', 'devam et' and the like carry no idea
+    finally:
+        db.close()
+
+
+def _search_only(state, have):
+    """[(id, record)] of the preference and note records `memrove search` ranks that the push hook never reads (recall.KINDS lacks them),
+    so the search dense lane sees them. Only the EG2 store gets them: the hook rescoring takes candidates from the static list."""
+    import json as _json
+    import sqlite3
+    from memrove_v3_chatsearch import REC_SOURCES
+    skip = {rid for rid, _ in have}
+    db = sqlite3.connect(f"file:{Path(state) / 'memory.sqlite3'}?mode=ro", uri=True, timeout=30)
+    try:
+        rows = db.execute("SELECT id, payload FROM records WHERE json_extract(payload,'$.kind') IN ('preference','note') AND ("
+                          + " OR ".join("coalesce(json_extract(payload,'$.source'),'') LIKE ?" for _ in REC_SOURCES) + ")",
+                          [x + "%" for x in REC_SOURCES]).fetchall()
+    finally:
+        db.close()
+    return [(rid, _json.loads(p)) for rid, p in rows if rid not in skip]
 
 
 def ensure_daemon(python=None, idle=600, wait=20.0):

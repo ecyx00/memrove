@@ -44,7 +44,7 @@ class T(unittest.TestCase):
         return (json.dumps(r) if r else None), 0.0, (None if r else 'boom')
 
     def item(self, i='a', text='Commit mesajları kısa olsun.', **kw):
-        return dict({'id': i, 'text': text, 'revision': 1}, **kw)
+        return dict({'id': i, 'text': text, 'revision': 1, 'egress': 'external_ok'}, **kw)   # an unlabelled item counts as device_only
 
     def ev(self, items, **kw):
         return ev.evaluate(self.state, 'j1', items, vault=self.vault, **kw)

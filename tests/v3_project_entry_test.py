@@ -40,7 +40,7 @@ class ProjectEntryTest(unittest.TestCase):
         ing(dict(base, id='card:loop', kind='note', text='Ship the importer', source='wiki/_sources/grab/loop.md', updated_at='2026-10-04'))
         th.apply_card(self.comp / 'Last-Session.md', 'sess0001xyz', 'alpha', 'index', '2026-10-05 10:00',
                       {'outcome': 'Index moved to Postgres.', 'reasoning': 'x', 'next': 'write the migration'}, [])
-        th.apply_threads(self.comp / 'Threads.md', self.state, 'alpha', '2026-10-05',
+        th.apply_threads(self.comp / 'Threads.md', self.state, 'alpha', __import__('datetime').date.today().isoformat(),  # relative: a fixed day goes dormant
                          [{'title': 'Importer', 'context': 'c', 'did': [], 'decisions': [], 'open': ['wire cli'], 'status': 'active'}], [])
         with self.engine.store._connect() as db:
             import memrove_v3_graph as G

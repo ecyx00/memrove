@@ -26,7 +26,7 @@ class TopicHeads(unittest.TestCase):
         (self.proj / ".git").mkdir(parents=True)
         self.docs = self.proj / "docs" / "state"
         self.docs.mkdir(parents=True)
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MEMROVE"))}
+        self.env = {**{k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MEMROVE"))}, "MEMROVE_READER": "local"}   # the owner, without a harness env
         self.env.update(HOME=str(tmp), CLAUDE_CODE_SESSION_ID="s1", MEMROVE_NO_LLM="1", MEMROVE_DOC_REPOS=str(self.proj))
         patch = mock.patch.dict(os.environ, {"MEMROVE_DOC_REPOS": str(self.proj)})
         patch.start()
@@ -171,10 +171,11 @@ class TopicHeads(unittest.TestCase):
     def test_h1_start_view_newest_five_capped_and_empty(self):
         import memrove_v3_heads as H
         import memrove_v3_hook as hook
-        payload = {"source": "startup", "cwd": str(self.proj)}
+        payload = {"source": "compact", "cwd": str(self.proj)}
         self.assertNotIn("heads", hook.session_notice(self.state, payload))
         for i in range(7):
             (self.docs / f"2026-10-0{i + 1}-t{i}.md").write_text(f"---\ntopic: topic-{i}\nstatus: open\ndecision: decision number {i}\nnext: do {i}\n---\n")
+        self.assertNotIn("heads", hook.session_notice(self.state, {**payload, "source": "startup"}))  # heads are compaction-only
         out = hook.session_notice(self.state, payload)
         self.assertIn("[topic-6] open decision number 6 | next: do 6", out)
         self.assertIn("[topic-2]", out)
@@ -200,6 +201,11 @@ class TopicHeads(unittest.TestCase):
         ok = self.docs / "2026-10-13-ingest-queue-b.md"
         ok.write_text("---\ntopic: ingest-queue\nstatus: open\ndecision: d\nnext: n\n---\n")
         self.assertIsNone(call(ok))
+        marker = self.proj / ".docs-guard-skip"  # repo opt-out marker, found by walking up from the file
+        marker.write_text("")
+        self.assertIsNone(call(bare))
+        marker.unlink()
+        self.assertIsNotNone(call(bare))
         self.assertIsNone(call(self.proj / "README.md"))
         self.assertIsNone(call(self.docs / "missing.md"))
         self.assertIsNone(call(bare, "Read"))
@@ -242,6 +248,21 @@ class TopicHeads(unittest.TestCase):
         off = subprocess.run([sys.executable, str(ROOT / "scripts/memrove_v3.py"), "--vault", str(self.vault), "--state", str(self.state), "project", "myproj"], env=env, capture_output=True, text=True).stdout
         self.assertIn("heads (newest", on)
         self.assertNotIn("heads (newest", off)
+
+    def test_writeup_cache_rereads_changed_mtime(self):
+        import memrove_v3_heads as H
+        f = self.docs / "2026-01-02-cachey.md"
+        f.write_text("---\ntopic: cachey\nstatus: open\ndecision: first\nnext: x\n---\n# T\n")
+        self.state.mkdir()
+        get = lambda: [e["decision"] for e in H.entries(self.state, "myproj") if e["topic"] == "cachey"]
+        self.assertEqual(get(), ["first"])
+        with mock.patch.object(H, "_writeup", side_effect=AssertionError("re-parsed an unchanged file")):
+            self.assertEqual(get(), ["first"])   # unchanged (mtime, size): served from the cache
+        f.write_text("---\ntopic: cachey\nstatus: open\ndecision: other\nnext: x\n---\n# T\n")
+        os.utime(f, ns=(1, 1))   # same size, new mtime
+        self.assertEqual(get(), ["other"])
+        f.unlink()
+        self.assertEqual(get(), [])
 
 
 if __name__ == "__main__":

@@ -2,7 +2,10 @@
 Pure functions over record dicts. Old fields (confidence, origin_type, verified_by, llm_verdict) stay readable: nothing here
 requires a new field to exist, and stamp() only adds what is missing."""
 
-EGRESS = ("device_only", "self_hosted", "external_ok")  # most restrictive first
+EGRESS = ("device_only", "self_hosted", "paid_ok", "external_ok")  # most restrictive first; paid_ok: a paid remote model (Haiku) yes, a free tier no
+TIERS = {"local": (), "paid": EGRESS[:2], "free": EGRESS[:3]}  # reader tier -> egress classes it never sees (local: this machine and the owner's own harnesses)
+OWNER_ENV = ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SANDBOX")  # set in the shells of Claude Code and Codex, the owner's paid harnesses
+AGENT_SOURCES = ("memrove-cli", "beyin-cli")  # source_system of `memrove remember` (beyin: its old name)
 RELIABILITY = {"user_explicit": 0.95, "external_source": 0.6, "derived": 0.5, "agent_inference": 0.4}
 STATES = ("assessed", "not_assessed", "insufficient", "unknown")
 FROM_VERIFIED = {"user_quote": "user_explicit", "llm": "agent_inference"}
@@ -84,12 +87,37 @@ def combine_egress(classes):
     return min(known, key=EGRESS.index) if known else "device_only"
 
 
+def visible_to(egress, tier):
+    """May a reader of this tier see a record with this egress label? Fail closed: an unknown or empty label counts as device_only, an unknown tier as free."""
+    return (egress if egress in EGRESS else "device_only") not in TIERS.get(tier, TIERS["free"])
+
+
+def reader_tier(env=None, tty=None):
+    """Tier of whoever runs the memrove CLI. MEMROVE_READER (local|paid|free) wins; Claude Code, Codex or an interactive terminal -> local
+    (sees all, as before); anything else (opencode, Gemini, a script with piped output) -> free. An unknown MEMROVE_READER value -> free."""
+    import os
+    import sys
+    env = os.environ if env is None else env
+    if env.get("MEMROVE_READER"):
+        return env["MEMROVE_READER"] if env["MEMROVE_READER"] in TIERS else "free"
+    if any(env.get(k) for k in OWNER_ENV):
+        return "local"
+    return "local" if (sys.stdout.isatty() if tty is None else tty) else "free"
+
+
+def agent_written(r):
+    """Written by a Claude Code agent through `memrove remember` (not --user) or `memrove card`: the text already went to Anthropic in
+    that session, so a paid Anthropic model may read it; a free tier may not. Capture, papercut, chat and doc writers never match."""
+    return r.get("origin_type") == "agent_inference" and not r.get("verified_by") and (
+        r.get("source_system") in AGENT_SOURCES or r.get("origin") == "agent")
+
+
 def egress_of(r, db=None):
-    """Own class (explicit, else Claude Code transcript origin = external_ok, else device_only) combined with the
+    """Own class (explicit, else Claude Code transcript origin = external_ok, else agent-written = paid_ok, else device_only) combined with the
     classes of every record in derived_from (looked up in `db`, a missing source counts as device_only)."""
     own = r.get("egress")
     if own not in EGRESS:
-        own = "external_ok" if r.get("verified_by") in FROM_VERIFIED or r.get("origin") == "llm" else "device_only"
+        own = "external_ok" if r.get("verified_by") in FROM_VERIFIED or r.get("origin") == "llm" else "paid_ok" if agent_written(r) else "device_only"
     classes = [own]
     for sid in r.get("derived_from") or []:
         if sid.startswith(TRANSCRIPT):
@@ -115,6 +143,8 @@ def stamp(meta):
     m.setdefault("assessment_state", assessment_state(m))
     if m.get("egress") not in EGRESS and (m.get("verified_by") in FROM_VERIFIED or m.get("origin") == "llm"):
         m["egress"] = "external_ok"  # Claude Code transcripts already go to Anthropic
+    elif m.get("egress") not in EGRESS and agent_written(m):
+        m["egress"] = "paid_ok"
     return m
 
 

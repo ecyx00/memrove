@@ -23,6 +23,7 @@ from memrove_v3_secrets import redact as redact_secrets, record as record_redact
 
 SKIP_NAMES = {"agents.md", "claude.md", "gemini.md", "skill.md", "hooks.md", "config.md", "settings.md",
               "instructions.md", "codex.md", "setup.md", "install.md"}
+SNAP_DIR = "wiki/_sources/snap"  # third-party raw snapshots with nested YAML: not owner memory
 SKIP_DIRS = {"node_modules", "receipts", "__pycache__"}
 GATE_KEYS = ("visibility", "trust", "trusted", "remote_allowed")  # narrowing keys must sit at the top level
 UNSUPPORTED = "unsupported YAML metadata; use JSON frontmatter"
@@ -147,6 +148,26 @@ def parse(text) -> tuple:
         if not found or found[1] in meta:
             raise ValueError(UNSUPPORTED)
         key, raw = found.groups()
+        style = re.fullmatch(r"([|>])[+-]?(\s+#.*)?", raw.strip())
+        if style:  # block scalar: every following indented (or blank) line is text
+            lines = []
+            while i < len(rows) and (not rows[i].strip() or rows[i].startswith(" ")):
+                lines.append(rows[i])
+                i += 1
+            while lines and not lines[-1].strip():
+                lines.pop()
+            pad = min((len(x) - len(x.lstrip()) for x in lines if x.strip()), default=0)
+            lines = [x[pad:] for x in lines]
+            meta[key] = ("\n".join(lines) if style[1] == "|" else re.sub(r"(?<!\n)\n(?!\n)", " ", "\n".join(lines))) + "\n"
+            continue
+        if raw.strip().startswith("{"):  # one-line JSON object
+            try:
+                meta[key] = json.loads(raw)
+            except ValueError:
+                raise ValueError(UNSUPPORTED) from None
+            if not isinstance(meta[key], dict) or any(k in GATE_KEYS for k in meta[key]):
+                raise ValueError(UNSUPPORTED)
+            continue
         if raw.strip():
             meta[key] = _value(raw)
             continue
@@ -265,7 +286,8 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
         self._overridden, self._present, self._reparsed, stamps = set(), set(), set(), {}
         for here, dirs, files in os.walk(self.root, followlinks=False):
             dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.casefold() not in SKIP_DIRS
-                             and not (Path(here) / d).is_symlink())
+                             and not (Path(here) / d).is_symlink()
+                             and (Path(here) / d).relative_to(self.root).as_posix() != SNAP_DIR)
             for name in sorted(files):  # stable order, so duplicate reports are stable
                 low = name.casefold()
                 if name.startswith(".") or not low.endswith(".md") or low in SKIP_NAMES or low.startswith("setup-"):
@@ -371,7 +393,9 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
             for rid, record in records.items():
                 row = db.execute("SELECT payload FROM records WHERE id=?", (rid,)).fetchone()
                 before = json.loads(row[0]) if row else None
-                if before and rid in owned and rid not in self._overridden:
+                if before and rid not in self._overridden and before["source_sha256"] == record["source_sha256"]:
+                    record = dict(before, source=record["source"])  # same Markdown: the store holds fields (assessments, status, rule) the file never had; a moved file keeps its new path
+                elif before and rid in owned and rid not in self._overridden:
                     changed = before["source_sha256"] != record["source_sha256"]
                     record["revision"] = max(record["revision"], before["revision"] + changed)
                 if rid in self._overridden:
@@ -401,6 +425,11 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
             db.executemany("INSERT OR REPLACE INTO scan_state VALUES (?,?,?)", [(k, v[0], v[1]) for k, v in self._stamps.items()])
         for entry in done:
             entry.unlink(missing_ok=True)  # the intended write is on disk and indexed
+        try:
+            import memrove_v3_triggers
+            memrove_v3_triggers.compile(self.root, self.state)  # the PreToolUse hook reads this file, never the DB
+        except Exception:
+            pass
         return {"status": "conflict" if conflicts else "degraded" if warnings else "succeeded", "indexed": len(records),
                 "mode": "full" if full else "incremental", "deleted": deleted, "warnings": warnings, "conflicts": conflicts}
 
@@ -421,7 +450,7 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
                 raise RevisionConflict("pending source operation; sync and resolve first")
             atomic(entry, _json({"source": source, "old_hash": None, "content": content, "kind": kind}))
             atomic(path, content)
-        result = self.sync()  # the index must see the new file before we read it back
+        result = self.sync(full=False)  # the index must see the new file before we read it back; only changed files are re-read (a full rescan per create cost seconds on 20k files)
         rid = metadata.get("id", "md-" + _hash(source)[:24])
         if any(isinstance(x, dict) and (x.get("source") == source or x.get("id") == rid)
                for key in ("warnings", "conflicts") for x in result[key]):

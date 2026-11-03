@@ -251,18 +251,24 @@ def user_words(content):
     return None if not text or text.startswith(NOT_WORDS) else text
 
 
+def is_headless(r):
+    """True for a record written by a headless run (`claude -p`, entrypoint sdk-*): its prompt is a machine's, not the owner's.
+    The record's own `entrypoint` decides, never the command line: an app may start interactive and headless sessions alike."""
+    return str(r.get("entrypoint") or "").startswith("sdk")
+
+
 def is_probe(r):
     """True for the developer's own test runs: a headless/SDK entrypoint (`claude -p`, sdk-cli) or a cwd under /tmp."""
     cwd = r.get("cwd") if isinstance(r.get("cwd"), str) else ""
-    return str(r.get("entrypoint") or "").startswith("sdk") or cwd.startswith(("/tmp/", "/private/tmp/")) or cwd in ("/tmp", "/private/tmp")
+    return is_headless(r) or cwd.startswith(("/tmp/", "/private/tmp/")) or cwd in ("/tmp", "/private/tmp")
 
 
 def claude_source(path, off):
     """-> (messages, new_offset). messages: {ts, kind, text, k}."""
     out, end, prev = [], off, None   # prev: the last assistant text, narration ("final": False) when a tool call follows it directly
     for _, end, r in _lines(path, off):
-        if not r or r.get("isSidechain"):
-            continue
+        if not r or r.get("isSidechain") or is_headless(r):
+            continue   # a headless run is never the owner's chat
         ts, t = r.get("timestamp"), r.get("type")
         if t == "assistant":
             body = (r.get("message") or {}).get("content")
@@ -443,6 +449,7 @@ def ingest(state, home=None, since=None, limit=None, lean_before=None):
         if h in seen:
             continue
         fresh.append(h)
+        seen.add(h)  # the same record reached through a second path in this pass
         if lean and m["ts"] < lean and m["kind"] == "agent" and m.get("final") is False:
             drop = stats.setdefault("lean_dropped", {})
             drop[m["src"]] = drop.get(m["src"], 0) + 1

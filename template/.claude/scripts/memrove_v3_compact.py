@@ -1,6 +1,6 @@
 """Lossless size control for the two companion handoff files (#96): rotate, never delete.
 
-Runs only as the explicit `memrove.py companion-compact` command: no timer, no model call,
+Runs as `memrove.py companion-compact` and in the SessionEnd detached worker: no timer, no model call,
 no interpretation of the text. When Last-Session.md or Threads.md is over its limit, the
 Previous/Closed history section and then the oldest dated entries move verbatim into a
 private monthly archive beside the companion files, until the file fits. The newest entry
@@ -187,6 +187,23 @@ def plan(text, name, limit, pointer):
             break
         moved_blocks.add(p)
         moved_lines.update(range(parsed[p]['start'], parsed[p]['end']))
+    if name == 'Threads.md' and projected() > limit:
+        # Last resort: every thread already shows only its newest update. Whole threads, least recently
+        # touched first, move verbatim too, so the file can reach its set point. The newest thread stays.
+        heads = [p for p, block in enumerate(parsed) if block['container'] == block['start'] and HEADING.match(lines[block['start']])
+                 and len(HEADING.match(lines[block['start']])[1]) == CONTAINER[name]]
+        spans = []
+        for p in heads:
+            last = max((q for q, b in enumerate(parsed) if b['container'] == parsed[p]['start']), default=p)
+            spans.append((p, [q for q in range(p, last + 1) if parsed[q]['kind'] != 'history']))
+        def newest(span):
+            return max((d for q in span[1] for d in DATE.findall(''.join(lines[parsed[q]['start']:parsed[q]['end']]))), default='')
+        for span in sorted(spans, key=lambda s: (newest(s), -s[0]))[:-1]:
+            if projected() <= limit:
+                break
+            for q in span[1]:
+                moved_blocks.add(q)
+                moved_lines.update(range(parsed[q]['start'], parsed[q]['end']))
     if not moved_lines:
         return None
     live, archive, label = [], [], None
@@ -205,7 +222,9 @@ def plan(text, name, limit, pointer):
                 label = None
         elif p in moved_blocks:
             owner = block['container']
-            if owner is not None and owner != label and len(HEADING.match(lines[owner])[1]) >= 2:
+            if owner == block['start']:
+                label = owner  # a whole thread moves: its heading block is already in the archive
+            elif owner is not None and owner != label and len(HEADING.match(lines[owner])[1]) >= 2:
                 archive.append(lines[owner] if lines[owner].endswith('\n') else lines[owner] + newline)
                 label = owner
             archive.extend(lines[i] for i in span)

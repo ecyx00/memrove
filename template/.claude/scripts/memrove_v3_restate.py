@@ -20,10 +20,12 @@ def _own(r):
 
 
 def pending(db, redo=False):
-    """Owner rule records without a restate assessment (redo: also the ones that have one)."""
+    """Owner rule records without a restate assessment (redo True: also the ones that have one; redo "unclear": only the ones left unclear)."""
     rows = [json.loads(p) for (p,) in db.execute("SELECT payload FROM records WHERE json_extract(payload,'$.kind') IN (?,?,?)", KINDS)]
-    return [r for r in rows if _own(r) and not r.get("valid_to") and r.get("visibility") != "private" and str(r.get("text") or "").strip()
-            and (redo or "restate" not in (r.get("assessments") or {}))]
+    has = lambda r: (r.get("assessments") or {}).get("restate")
+    want = (lambda r: (has(r) or {}).get("state") == "unclear") if redo == "unclear" else (lambda r: redo or not has(r))
+    return [r for r in rows if _own(r) and not r.get("valid_to") and r.get("status") != "dropped_llm" and r.get("visibility") != "private" and str(r.get("text") or "").strip()
+            and want(r)]
 
 
 def known_projects(db):
@@ -32,28 +34,46 @@ def known_projects(db):
 
 
 def item_of(r, projects, ctx=None):
+    from memrove_v3_trust import egress_of
     label = "" if str(r.get("project") or "") in GENERIC else str(r["project"])
     window = ctx or r.get("ctx") or ("owner: " + str(r["prev"])[:200] if r.get("prev") else "")
     return {"id": r["id"], "text": " ".join(str(r["text"]).split())[:300], "prev": window, "label": label,
-            "why": " ".join(str(r.get("why") or "").split())[:300], "projects": projects, "revision": r.get("revision")}
+            "why": " ".join(str(r.get("why") or "").split())[:300], "projects": projects, "revision": r.get("revision"), "egress": egress_of(r)}
+
+
+DRAWN = {"assessed", "unclear"}  # states of a draw that answered (unclear = it said standing_rule unclear)
 
 
 def two_votes(state, items, vault=None, root=None):
-    """Two independent evaluator draws per item; the record counts as a standing rule only when both say yes with the same scope and project
-    (otherwise standing_rule is stored as unclear). One draw flips on borderline statements; a rule that stays in a block should not. -> assessments."""
+    """Two independent evaluator draws per item; a third draw (one batched call) only when both answered, disagree and one says yes. The record
+    counts as a standing rule when 2 of the 3 draws say yes with the same scope and project; the answers come from a yes draw of that pair.
+    Otherwise standing_rule is stored as unclear. Two no draws stay no. -> assessments."""
     import memrove_v3_evaluator as ev
     first = ev.evaluate(state, "restate", items, vault=vault, root=root)
     second = ev.evaluate(state, "restate", [dict(i, salt="2") for i in items], vault=vault, root=root)
+    split = [k for k, (a, b) in enumerate(zip(first, second)) if {a["state"], b["state"]} <= DRAWN and not _agree(a["answers"], b["answers"])
+             and "yes" in (a["answers"]["standing_rule"], b["answers"]["standing_rule"])]
+    third = dict(zip(split, ev.evaluate(state, "restate", [dict(items[k], salt="3") for k in split], vault=vault, root=root))) if split else {}
     out = []
-    for a, b in zip(first, second):
-        x, y = a["answers"], b["answers"]
-        if a["state"] == "assessed" and b["state"] == "assessed" and x["standing_rule"] == "yes" and not (
-                y["standing_rule"] == "yes" and x["scope"] == y["scope"] and _same_project(x["project"], y["project"])):
-            a = dict(a, answers=dict(x, standing_rule="unclear"), state="unclear")
+    for k, (a, b) in enumerate(zip(first, second)):
+        if k in third:
+            draws = [a, b] + ([third[k]] if third[k]["state"] in DRAWN else [])
+            pair = next((x for x, y in ((0, 1), (0, 2), (1, 2)) if y < len(draws) and draws[x]["answers"]["standing_rule"] == "yes"
+                         and _agree(draws[x]["answers"], draws[y]["answers"])), None)
+            if pair is not None:
+                a = dict(draws[pair], item_id=a["item_id"], revision=a["revision"])
+            elif third[k]["state"] == "not_assessed":
+                a = dict(a, state="not_assessed")   # the deciding draw failed: retry the record next run
+            else:
+                a = dict(a, answers=dict(a["answers"], standing_rule="unclear"), state="unclear")
         elif a["state"] != "not_assessed" and b["state"] == "not_assessed":
             a = dict(a, state="not_assessed")   # one draw failed: wait for a full pair
         out.append(a)
     return out
+
+
+def _agree(x, y):
+    return x["standing_rule"] == y["standing_rule"] and (x["standing_rule"] != "yes" or (x["scope"] == y["scope"] and _same_project(x["project"], y["project"])))
 
 
 def _same_project(a, b):
@@ -166,7 +186,7 @@ def backfill(engine, vault, state, apply_changes, log_path, limit=400, redo=Fals
             return out
         before = {r["id"]: r.get("revision") for r in rows}
         cache = {}
-        ev.BUDGET = {"left": 2 * (len(rows) // BATCH) + 40, "calls": 0, "cost": 0.0}  # one-off: outside the daily cap, bounded by its own count
+        ev.BUDGET = {"left": 3 * (len(rows) // BATCH) + 40, "calls": 0, "cost": 0.0}  # one-off: outside the daily cap, bounded by its own count
         for i in range(0, len(rows), BATCH):
             items = []
             for r in rows[i:i + BATCH]:
@@ -186,9 +206,9 @@ def backfill(engine, vault, state, apply_changes, log_path, limit=400, redo=Fals
         lock.unlink(missing_ok=True)
 
 
-def adopt(engine, state, copy_state, log_path):
+def adopt(engine, state, copy_state, log_path, redo=False):
     """Write onto the live store the restate results computed on a copy of it (what was shown is what is written). Records that already
-    have a restate result are skipped; text and status are never touched. Logs ids to log_path for undo. -> {written, skipped}"""
+    have a restate result are skipped (redo "unclear": unless that result is unclear); text and status are never touched. Logs ids to log_path for undo. -> {written, skipped}"""
     import sqlite3
     from memrove_v3_llm import _locked
     from memrove_v3_projections import update_record
@@ -203,7 +223,8 @@ def adopt(engine, state, copy_state, log_path):
             with engine.store._connect() as db:
                 row = db.execute("SELECT payload FROM records WHERE id=?", (c["id"],)).fetchone()
             live = json.loads(row[0]) if row else None
-            if not live or c["id"].startswith("q-replay") or "restate" in (live.get("assessments") or {}):
+            old = (live.get("assessments") or {}).get("restate") if live else None
+            if not live or c["id"].startswith("q-replay") or (old and not (redo == "unclear" and old.get("state") == "unclear")):
                 done["skipped"] += 1
                 continue
             changes = {"assessments": dict(live.get("assessments") or {}, restate=c["assessments"]["restate"])}
@@ -242,13 +263,14 @@ def main(argv):
     ap.add_argument("--vault", required=True)
     ap.add_argument("--apply", action="store_true", help="backfill: write; without it only count")
     ap.add_argument("--log", required=True)
+    ap.add_argument("--redo-unclear", action="store_true", help="backfill/adopt: redo only the records whose restate result is unclear")
     a = ap.parse_args(argv)
     from memrove_v3_sync import SyncEngine
     engine = SyncEngine(a.vault, a.state)
     if a.cmd == "backfill":
-        res = backfill(engine, a.vault, a.state, a.apply, a.log)
+        res = backfill(engine, a.vault, a.state, a.apply, a.log, redo="unclear" if a.redo_unclear else False)
     elif a.cmd == "adopt":
-        res = adopt(engine, a.state, a.from_copy, a.log)
+        res = adopt(engine, a.state, a.from_copy, a.log, redo="unclear" if a.redo_unclear else False)
     else:
         res = {"removed": undo(engine, a.log)}
     print(json.dumps(res))
