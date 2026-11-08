@@ -807,9 +807,30 @@ def pages(lines, limit=PAGE):
     return out + [cur] if cur or not out else out
 
 
+SETTLED_STUB = 48   # characters of a settled node's own text kept in its one short line
+
+
+def map_lines(state, mem):
+    """The view's lines, a settled branch's as one short line. state/reflect-settled.json (written by `Core.reflect(kind="settle")`, memrove_v3_reflect.settle)
+    lists the 128-message blocks that are old and hold no open record; a view node lying wholly inside them keeps its id, the first characters of its
+    own text and a zoom hint. Only this rendering changes: the node text, the log and the messages are untouched, `memrove zoom id n` opens them."""
+    try:
+        blocks = set(_load_json(Path(state) / "reflect-settled.json", {}).get("blocks", []))
+    except (OSError, ValueError, AttributeError):
+        blocks = set()
+    out = []
+    for l, i in mem.view.parts:
+        line = mem.tree.line(l, i)
+        if blocks and all(b in blocks for b in range((i << l) // 128, (((i + 1) << l) - 1) // 128 + 1)) and PLACEHOLDER not in line:
+            head, _, body = line.partition("|")
+            line = f"{head}|{body[:SETTLED_STUB]}… (settled: zoom {i << l} {1 << l})"
+        out.append(line)
+    return out
+
+
 def wake(state, part=1):
     mem = _mem(state)
-    pg = pages([mem.tree.line(*p) for p in mem.view.parts])
+    pg = pages(map_lines(state, mem))
     if not 1 <= part <= len(pg):
         raise ValueError(f"part {part} does not exist: the view has {len(pg)} parts")
     tail = f"(part {part}/{len(pg)}: " + (f"next `memrove wake {part + 1}`" if part < len(pg) else f"end of the view, {mem.T} messages") + ")"
@@ -819,7 +840,7 @@ def wake(state, part=1):
 def wake_all(state):
     """Every part of the view in one text (what a mod puts into the context)."""
     mem = _mem(state)
-    return "\n".join(wake(state, k) for k in range(1, len(pages([mem.tree.line(*p) for p in mem.view.parts])) + 1))
+    return "\n".join(wake(state, k) for k in range(1, len(pages(map_lines(state, mem))) + 1))
 
 
 def _page(r, i, page):

@@ -105,7 +105,29 @@ def count(state):
     return 0
 
 
+def hidden(state_or_dir, which="chat"):
+    """Ids hard-forgotten by the owner (state/chatlog/hidden.json): kept on disk, never returned by a reader. which: chat | imports."""
+    d = Path(state_or_dir)
+    d = d if (d / "main").is_dir() or d.name == "chatlog" else d / "chatlog"
+    return set(_load_json(d / "hidden.json", {}).get(which, ()))
+
+
+def hide(state, chat=(), imports=()):
+    cur = _load_json(root(state) / "hidden.json", {})
+    for k, ids in (("chat", chat), ("imports", imports)):
+        cur[k] = sorted(set(cur.get(k, ())) | set(ids), key=str)
+    root(state).mkdir(parents=True, exist_ok=True)
+    write_json(root(state) / "hidden.json", cur)
+
+
 def read_file(path):
+    skip = hidden(Path(path).parent.parent)
+    for r in _read_all(path):
+        if r["i"] not in skip:
+            yield r
+
+
+def _read_all(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         for raw in f:
             try:

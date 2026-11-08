@@ -143,6 +143,25 @@ def is_forgotten(db, rec) -> bool:
         return False
 
 
+def _forgotten_rows(data):
+    """Only well-formed [hash, id, source, ts] rows; anything else in forgotten.json is dropped, so a junk file never blocks forget or open."""
+    return [list(r) for r in data if isinstance(r, (list, tuple)) and len(r) == 4 and isinstance(r[0], str)] if isinstance(data, list) else []
+
+
+def keep_forgotten(state, rows):
+    """Hard-forgotten (hash, id, source, ts) rows also live in state/forgotten.json (hash, id, source path, ts), so a store rebuilt from the vault still skips them."""
+    path = Path(state) / "forgotten.json"
+    try:
+        have = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        have = []
+    have = _forgotten_rows(have)
+    have += [list(r) for r in rows if r[0] not in {h[0] for h in have}]
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(have), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 class MemoryStore:  # one SQLite file per runtime directory, bound to exactly one vault
 
     def __init__(self, state_dir, vault_root, read_only: bool = False):
@@ -159,6 +178,12 @@ class MemoryStore:  # one SQLite file per runtime directory, bound to exactly on
         with self._connect() as db:
             for statement in TABLES:
                 db.execute(statement)
+            try:
+                db.executemany("INSERT OR IGNORE INTO forgotten VALUES (?,?,?,?)", _forgotten_rows(json.loads(self.state_dir.joinpath("forgotten.json").read_text(encoding="utf-8"))))
+            except OSError:
+                pass  # no hard forget yet
+            except (ValueError, TypeError, sqlite3.Error) as e:
+                print(f"memrove: ignoring unreadable forgotten.json ({e})", file=sys.stderr)
             bound = self._bound(db)
             _need(bound in (None, str(self.vault_root)), "runtime belongs to another vault")
             if bound is None:

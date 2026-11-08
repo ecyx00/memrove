@@ -32,7 +32,8 @@ def _own(r):
 
 
 def _live(r):
-    return not (r.get("restate_dup_of") or r.get("visibility") == "private" or r.get("verdict") == "reject" or r.get("valid_to") or r.get("status") == "deleted_by_user")
+    return not (r.get("restate_dup_of") or r.get("unverified") or  # unverified (Core.reflect: the messages do not support it) never becomes a standing rule
+ r.get("visibility") == "private" or r.get("verdict") == "reject" or r.get("valid_to") or r.get("status") == "deleted_by_user")
 
 
 def _restated(r):

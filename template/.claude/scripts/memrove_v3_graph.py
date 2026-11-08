@@ -168,7 +168,8 @@ def add_edge(db, src, dst, type, why, prov):
         raise ValueError('an edge needs a why (one sentence)')
     if src == dst:
         raise ValueError('an edge needs two different nodes')
-    db.execute('INSERT OR REPLACE INTO graph_edges(src,dst,type,why,prov,ts,valid_from,recorded_at) VALUES (?,?,?,?,?,?,?,?)', (src, dst, type, why, json.dumps(prov, ensure_ascii=False, sort_keys=True), prov['at'], prov['at'], prov['at']))
+    # upsert keeps valid_from/valid_to/recorded_at: a refresh never reopens a closed edge or moves its interval
+    db.execute('INSERT INTO graph_edges(src,dst,type,why,prov,ts,valid_from,recorded_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(src,dst,type) DO UPDATE SET why=excluded.why, prov=excluded.prov, ts=excluded.ts', (src, dst, type, why, json.dumps(prov, ensure_ascii=False, sort_keys=True), prov['at'], prov['at'], prov['at']))
 
 
 def add_concept(db, name, why, prov):

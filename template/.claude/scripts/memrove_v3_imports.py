@@ -90,6 +90,7 @@ def scored(state, q, since, until, top, cand=200, prefix=0.6):
     if not path.exists():
         return []
     import memrove_v3_chatsearch as cs
+    skip = chatlog.hidden(state, "imports")  # hard-forgotten by the owner
     db = sqlite3.connect(path, timeout=cs.BUSY)   # lane_text lowers BUSY: a locked imports.db must not stall the hook
     try:
         where, args = [], []
@@ -111,9 +112,9 @@ def scored(state, q, since, until, top, cand=200, prefix=0.6):
                 for i, d, k, t, b in db.execute(sql, (expr, *args, cand)):
                     prev = best.get(i)
                     best[i] = ((prev[0] if prev else 0.0) + weight * b, (i, d, k, t))
-            return sorted(best.values(), key=lambda p: p[0])[:top]
-        rows = db.execute(f"SELECT id, date, kind, text FROM x WHERE {w} ORDER BY date DESC, id DESC LIMIT ?", (*args, top)).fetchall()
-        return [(None, r) for r in rows]
+            return [p for p in sorted(best.values(), key=lambda p: p[0]) if p[1][0] not in skip][:top]
+        rows = db.execute(f"SELECT id, date, kind, text FROM x WHERE {w} ORDER BY date DESC, id DESC LIMIT ?", (*args, top + len(skip))).fetchall()
+        return [(None, r) for r in rows if r[0] not in skip][:top]
     finally:
         db.close()
 
@@ -122,6 +123,8 @@ def get(state, xid):
     """-> {"kind", "date", "text"} or None."""
     path = chatlog.root(state) / "imports.db"
     if not path.exists():
+        return None
+    if xid in chatlog.hidden(state, "imports"):
         return None
     db = sqlite3.connect(path, timeout=30)
     try:

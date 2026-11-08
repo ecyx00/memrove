@@ -403,6 +403,9 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
                     record = project_record(self, record)
                 if before and before.get("valid_to") and not record.get("valid_to"):
                     record["valid_to"] = before["valid_to"]  # a close (Core.update) is store state; a file rebuild must not reopen it
+                for k in ("unverified", "reflect"):  # reflect marks are store state too (Core.reflect)
+                    if before and before.get(k) and not record.get(k):
+                        record[k] = before[k]
                 payload = _json(record)  # canonical form, comparable with the stored one
                 if row and rid not in owned and row[0] != payload:
                     conflicts.append({"id": rid, "reason": "id already owned by another record"})

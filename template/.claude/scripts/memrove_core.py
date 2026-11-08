@@ -2,6 +2,7 @@
 Stdlib only, no LLM call. Design: personal-intelligence/docs/design/2026-11-07-memrove-engine.md sections 5, 6, 12.
 scope = {space, project, agent, session, tags}. Hit = {id, text, score, arm, evidence:[{kind, ref}], valid_from, valid_to, origin}.
 Evidence is a list but only kind "msg" (a chat-log message id) is built: memrove stores no code and links no code (owner, 2026-11-07)."""
+import contextlib
 import json
 import os
 import re
@@ -17,10 +18,19 @@ import memrove_v3_graph as graph  # noqa: E402
 import memrove_v3_outcomes as outcomes  # noqa: E402
 import memrove_v3_relate as relate  # noqa: E402
 import memrove_v3_secrets as secrets  # noqa: E402
-from memrove_v3 import is_forgotten, text_hash  # noqa: E402
+from memrove_v3 import is_forgotten, keep_forgotten, text_hash  # noqa: E402
 from memrove_v3_sync import SyncEngine  # noqa: E402
 
 DEFAULT_AGENT = "claude-code"  # design 12.6: hook-captured records with no source
+
+
+def agent_of(r):
+    """Which agent wrote a record: its own field, else the reader that imported it ("codex-session" -> codex), else the hook default."""
+    return r.get("agent") or (str(r.get("imported_from") or "").removesuffix("-session") or DEFAULT_AGENT)
+
+
+FILE_FIELDS = {"close": ("valid_to", "superseded_by"), "reflect": ("unverified", "reflect")}  # _patch event -> payload fields kept in the vault file
+SRC_AGENT = {"claude": "claude-code"}  # chat-log `src` -> agent name; codex, antigravity, ... are their own names
 
 
 def _today():
@@ -90,6 +100,15 @@ class Core:
         self.store, self.state = self.sync.store, str(self.sync.state)
         with self.store._connect() as db:
             graph.ensure(db)  # idempotent bi-temporal migration
+            self._backfill_agent(db)
+
+    @staticmethod
+    def _backfill_agent(db):
+        """Write `agent` into records that lack it (derived by agent_of). Idempotent; no row is added or removed; no event (derived metadata, agent_of covers a rebuilt record)."""
+        for rid, p in db.execute("SELECT id, payload FROM records WHERE json_extract(payload,'$.agent') IS NULL").fetchall():
+            r = json.loads(p)
+            r["agent"] = agent_of(r)
+            db.execute("UPDATE records SET payload=? WHERE id=?", (json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":")), rid))
 
     # ---- write
     def ingest(self, items, scope=None):
@@ -128,13 +147,66 @@ class Core:
         res = remember(self.sync, new.get("kind", old.get("kind", "note")), new["text"], why=new.get("why"), project=new.get("project") or old.get("project"),
                        source=new.get("source", "memrove-core"), topic=new.get("topic") or old.get("topic"), valid_from=start,
                        agent=new.get("agent") or old.get("agent") or DEFAULT_AGENT, supersedes=[oid] if supersedes else ())
-        if supersedes and not old.get("valid_to"):
-            old["valid_to"] = start
+        closes = supersedes and not old.get("valid_to") and res["id"] != oid and res.get("status") != "exists"  # same text = same record: never close what was just written
+        if closes:
+            self._patch(oid, "close", valid_to=start)
+        return {**res, "closed": oid if closes else None, "proposals": relate_new(self, res)}
+
+    def _patch(self, rid, event, **fields):
+        """Set payload fields on a stored record and log one event. Returns the new payload; nothing is deleted."""
+        with self.store._connect() as db:
+            old = json.loads(db.execute("SELECT payload FROM records WHERE id=?", (rid,)).fetchone()[0])
+            old.update(fields)
+            if event in FILE_FIELDS:
+                self._fields_to_file(old, FILE_FIELDS[event])
             body = json.dumps(old, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            with self.store._connect() as db:
-                db.execute("UPDATE records SET payload=? WHERE id=?", (body, oid))
-                db.execute("INSERT INTO events(event_type,record_id,revision,record) VALUES ('close',?,?,?)", (oid, old.get("revision", 1), body))
-        return {**res, "closed": oid if supersedes else None, "proposals": relate_new(self, res)}
+            db.execute("UPDATE records SET payload=? WHERE id=?", (body, rid))
+            db.execute("INSERT INTO events(event_type,record_id,revision,record) VALUES (?,?,?,?)", (event, rid, old.get("revision", 1), body))
+        return old
+
+    def _fields_to_file(self, rec, keys):
+        """A close or a reflect mark is also written into the source file's front matter, so a store rebuilt from the vault keeps it.
+        rec["source_sha256"] follows the new bytes, so sync does not see a hand edit."""
+        from memrove_v3_sync import _hash, atomic, parse, render
+        try:
+            path = self.sync._path(rec["source"], existing=True)
+            meta, body = parse(path.read_text(encoding="utf-8"))
+        except (KeyError, ValueError, OSError):
+            return  # no file behind this record
+        meta.update({k: rec[k] for k in keys if rec.get(k)})
+        text = render(meta, body)
+        atomic(path, text)
+        rec["source_sha256"] = _hash(text)
+
+    def _hide_text(self, texts):
+        """Hard forget: hide every copy of the text that stays on disk (chat log, imports.db) from all readers by id; drop the derived rows
+        (chat search index, idea cards). Nothing in the chat log, the imports or the vault is deleted. Text shorter than 8 characters is not matched."""
+        want = [" ".join(t.split()).casefold() for t in texts if len(" ".join(t.split())) >= 8]
+        hit = lambda t: any(w in " ".join(str(t).split()).casefold() for w in want)
+        out = {"chat": 0, "imports": 0, "search": 0, "cards": 0}
+        if not want:
+            return out
+        d = chatlog.root(self.state)
+        chat = [r["i"] for f in chatlog._files(d) for r in chatlog.read_file(f) if hit(r.get("text"))]
+        imp = []
+        if (d / "imports.db").exists():
+            with contextlib.closing(sqlite3.connect(d / "imports.db", timeout=30)) as db:
+                imp = [i for i, t in db.execute("SELECT id, text FROM x") if hit(t)]
+        chatlog.hide(self.state, chat, imp)
+        out["chat"], out["imports"] = len(chat), len(imp)
+        for name, table, fts, ids in (("search.db", "m", "fts", chat), (None, "cards", "cards_fts", chat)):
+            path = d / name if name else Path(self.state) / "ideacards.sqlite3"
+            if not ids or not path.exists():
+                continue
+            with contextlib.closing(sqlite3.connect(path, timeout=30)) as db:
+                try:
+                    for i in ids:
+                        out["search" if name else "cards"] += db.execute(f"DELETE FROM {table} WHERE id=?", (i,)).rowcount
+                        db.execute(f"DELETE FROM {fts} WHERE rowid=?", (i,))
+                    db.commit()
+                except sqlite3.OperationalError:
+                    pass
+        return out
 
     def forget(self, target, mode="tombstone"):
         """target: record id (prefix ok) or a scope dict (project/session/agent, at least one). tombstone keeps the row (status deleted_by_user, valid_to set).
@@ -150,15 +222,19 @@ class Core:
                 rows = db.execute(f"SELECT id, payload FROM records WHERE {where}", [target[k] for k in keys]).fetchall()
             else:
                 rows = [self._one(db, target)]
-            n = {}
+            n, texts, listed = {}, [], []
+            if mode == "hard":
+                db.execute("PRAGMA secure_delete=ON")  # freed pages are zeroed, not left with the text
             for rid, payload in rows:
                 if mode == "tombstone":
                     self.sync._tombstone(db, rid, payload)
                     continue
                 rec = json.loads(payload)
+                texts.append(rec.get("text") or "")
                 now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 for h in ("id:" + rid, text_hash(rec.get("text"))):
                     db.execute("INSERT OR IGNORE INTO forgotten VALUES (?,?,?,?)", (h, rid, rec.get("source"), now))
+                    listed.append([h, rid, rec.get("source"), now])
                 for t, sql, a in (("events", "DELETE FROM events WHERE record_id=?", (rid,)), ("records", "DELETE FROM records WHERE id=?", (rid,)),
                                   ("markdown_sources", "DELETE FROM markdown_sources WHERE id=?", (rid,)),
                                   ("graph_edges", "DELETE FROM graph_edges WHERE src=? OR dst=?", (rid, rid)),
@@ -166,8 +242,11 @@ class Core:
                                   ("links", "DELETE FROM links WHERE src=? OR dst=?", (rid, rid))):
                     n[t] = n.get(t, 0) + _del(db, sql, a)
             ids = [r[0] for r in rows]
+            if mode == "hard":
+                keep_forgotten(self.state, listed)  # before the commit: if it fails nothing is deleted
         if mode == "hard":
             n["vectors"] = self._drop_vectors(ids)
+            n["hidden"] = self._hide_text(texts)
         return {"mode": mode, "ids": ids, "deleted": n}
 
     def _drop_vectors(self, ids):
@@ -188,10 +267,10 @@ class Core:
         return outcomes.feedback(rid, signal, reason)
 
     # ---- read
-    def recall(self, query, scope=None, arms=None, k=8, budget_tokens=None, as_of=None):
-        """Chat log + records through chatsearch.merged (the 93.1 any@5 lane), as Hits in merged order. arms: subset of {"chat","record"}. as_of: ISO day."""
+    def recall(self, query, scope=None, arms=None, k=8, budget_tokens=None, as_of=None, agent=None):
+        """Chat log + records through chatsearch.merged (the 93.1 any@5 lane), as Hits in merged order. arms: subset of {"chat","record"}. as_of: ISO day. agent: only hits written by that agent (chat messages by their source)."""
         scope = scope or {}
-        rows = cs.merged(self.state, query, top=k, until=as_of)
+        rows = cs.merged(self.state, query, top=k * 4 if agent else k, until=as_of)
         recs = {i.removeprefix("rec:") for i, *_ in rows if isinstance(i, str) and i.startswith("rec:")}
         meta = {}
         if recs:
@@ -204,6 +283,10 @@ class Core:
             arm = "record" if r is not None else "chat"
             if (arms and arm not in arms) or (r is not None and scope.get("project") and r.get("project") != scope["project"]):
                 continue
+            if agent and not self._by_agent(i, r, agent):
+                continue
+            if len(hits) >= k:
+                break
             used += len(text) // 4 + 1
             if budget_tokens and hits and used > budget_tokens:
                 break
@@ -212,7 +295,13 @@ class Core:
                          "origin": (r or {}).get("agent") or (DEFAULT_AGENT if r is not None else kind)})
         return hits
 
-    def as_of(self, t, project=None, kind=None):
+    def _by_agent(self, i, r, agent):
+        if r is not None:
+            return agent_of(r) == agent
+        m = chatlog.get(self.state, int(i)) if str(i).isdigit() else None  # an import id has no source here: fail closed
+        return bool(m) and SRC_AGENT.get(m.get("src"), m.get("src")) == agent
+
+    def as_of(self, t, project=None, kind=None, agent=None):
         """Records true at ISO time t: valid_from <= t AND (valid_to IS NULL OR valid_to > t). -> [(id, payload dict)]."""
         q = ("SELECT id, payload FROM records WHERE json_extract(payload,'$.valid_from') <= ? "
              "AND (json_extract(payload,'$.valid_to') IS NULL OR json_extract(payload,'$.valid_to') > ?)")
@@ -222,7 +311,8 @@ class Core:
                 q += f" AND json_extract(payload,'$.{k}')=?"
                 args.append(v)
         with self.store._connect() as db:
-            return [(i, json.loads(p)) for i, p in db.execute(q, args)]
+            rows = [(i, json.loads(p)) for i, p in db.execute(q, args)]
+        return [(i, r) for i, r in rows if not agent or agent_of(r) == agent]
 
     def edges_as_of(self, rid, t):
         with self.store._connect() as db:
@@ -249,9 +339,17 @@ class Core:
                 front = nxt
         return {"id": oid, "arm": "record", "record": json.loads(payload), "edges": edges}
 
-    def reflect(self, scope=None, kind="project"):
-        """kind: card (newest project card), tree (chat summary tree, part 1), project (task-start pack for the project)."""
+    def reflect(self, scope=None, kind="project", day=None, cap_tokens=None, max_calls=None, dry=False, until=None, check_model=None):
+        """kind: card (newest project card), tree (chat summary tree, part 1), project (task-start pack for the project),
+        dream (idle pass over one day, Haiku via memrove_v3_reflect: marks unsupported records, merges duplicates, closes stale ones; never deletes) -> stats."""
         scope = scope or {}
+        if kind == "dream":
+            import memrove_v3_reflect as dream
+            kw = {k: v for k, v in (("cap_tokens", cap_tokens), ("max_calls", max_calls)) if v}
+            return dream.run(self, day, scope=scope, dry=dry, until=until, check_model=check_model, **kw)
+        if kind == "settle":
+            import memrove_v3_reflect as dream
+            return dream.settle(self, day)
         if kind == "card":
             import memrove_v3_card as card
             return card.block(self.state, scope.get("project"))
@@ -261,4 +359,4 @@ class Core:
         if kind == "project":
             from memrove_v3_context import context_pack
             return context_pack(self.store, "", project=scope.get("project"))
-        raise ValueError("kind must be card, tree or project")
+        raise ValueError("kind must be card, tree, project or dream")
