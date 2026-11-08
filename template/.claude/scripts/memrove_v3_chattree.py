@@ -4,7 +4,7 @@ Follows Taelin's OptChat / UniiChat spec:
   node(0, i) = message i; node(l, i) = node(l-1, 2i) + node(l-1, 2i+1) merged; each in at most 512 bytes, named `id+n` (id = first message).
   A short message / a pair of short lines is its own node (no model call). Each node is built once, logged to tree/, never rebuilt.
   The view = the nodes covering the whole chat, oldest first, kept in view.json and never rebuilt from the log. It grows one line per message;
-  past 32 KB one batch merges the most due pairs (due = (T - last message) / 2^l, oldest first on ties) until it is at most 16 KB
+  past 18 KB one batch merges the most due pairs (due = (T - last message) / 2^l, oldest first on ties) until it is at most 12 KB
   (`chatlog_view_hi` / `chatlog_view_lo` in llm-config.json).
   A second, smaller view (16-32 KB, same fold) is the context a compaction reads.
 
@@ -27,7 +27,7 @@ from memrove_v3_chatlog import root, write_json, _load_json
 
 NODE = 512               # the spec's line size: parents that fit are joined without a model
 SLACK = 24               # the spec: a few bytes over is fine; a line up to NODE + SLACK is accepted without a retry
-VIEW_HI, VIEW_LO = 32_000, 16_000   # defaults; llm-config.json chatlog_view_hi / chatlog_view_lo (bytes) override them
+VIEW_HI, VIEW_LO = 18_000, 12_000   # defaults (wake map of at most ~6k tokens: the drain is byte-triggered, so a bigger hi left the newest day unrolled); llm-config.json chatlog_view_hi / chatlog_view_lo (bytes) override them
 CV_HI, CV_LO = 32_000, 16_000
 PAGE = 26_000            # UTF-16 characters of one `memrove wake` / `memrove zoom` page, under Claude Code's ~30k Bash output cap
 TRIES = 5

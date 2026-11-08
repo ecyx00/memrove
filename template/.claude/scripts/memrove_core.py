@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memrove_v3_chatlog as chatlog  # noqa: E402
 import memrove_v3_chatsearch as cs  # noqa: E402
+import memrove_v3_evidence as evidence  # noqa: E402
 import memrove_v3_graph as graph  # noqa: E402
 import memrove_v3_outcomes as outcomes  # noqa: E402
 import memrove_v3_relate as relate  # noqa: E402
@@ -125,6 +126,11 @@ class Core:
             out.append(remember(self.sync, it.get("kind", "note"), it["text"], why=it.get("why"), project=it.get("project") or scope.get("project"),
                                 session=scope.get("session"), source=it.get("source", "memrove-core"), topic=it.get("topic"),
                                 valid_from=it.get("valid_from"), agent=scope.get("agent") or DEFAULT_AGENT, user=bool(it.get("user"))))
+            if out[-1].get("id"):
+                try:
+                    evidence.mark(self, out[-1]["id"])  # shortcut: loads the whole chat log per call, pass a cached log= if ingest gets hot
+                except Exception as e:  # a failed verdict must never fail the write; class name only
+                    print(f"memrove: evidence mark failed: {type(e).__name__}", file=sys.stderr)
             out[-1]["proposals"] = relate_new(self, out[-1])
         return out
 

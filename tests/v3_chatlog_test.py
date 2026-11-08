@@ -755,7 +755,7 @@ class GateTest(Base):
         self.assertTrue(cli.parser().parse_args(['--vault', '/tmp', 'chatlog', 'run', '--no-force']).no_force)
 
     def test_view_limits_from_config_and_an_existing_larger_view_shrinks_by_the_drain(self):
-        self.assertEqual(ct.view_limits(self.state), (32_000, 16_000))
+        self.assertEqual(ct.view_limits(self.state), (18_000, 12_000))
         cfg = self.state / 'llm-config.json'
         cfg.write_text(json.dumps({'chatlog_view_hi': 1_000_000, 'chatlog_view_lo': 900_000}))
         self.add(60, size=700, date=self.now())
@@ -775,6 +775,27 @@ class GateTest(Base):
         self.assertEqual(json.loads((self.state / 'chatlog/usage.json').read_text())['calls'], calls)
         cfg.write_text(json.dumps({'chatlog_view_hi': 100, 'chatlog_view_lo': 500}))   # lo over hi: lo falls to half of hi
         self.assertEqual(ct.view_limits(self.state), (100, 50))
+
+    def test_newest_messages_roll_up_under_the_default_view_budget_and_zoom_reaches_all(self):
+        self.add(60, size=700, date=self.now())   # ~25 KB of one-message lines: under the old 32 KB hi nothing rolled up
+        self.stub(lambda payload: '\n'.join(f'[[{m[1]}]] ' + 'q' * 400 for m in ct.re.finditer(r'<input key="\[\[(\d+)\]\]"', payload)))
+        with chatlog.lock(self.state):
+            for _ in range(6):
+                ct.compact(self.state, self.vault, force=True)
+        mem = ct.Memory(self.state)
+        self.assertLessEqual(mem.view.total, ct.VIEW_HI)
+        self.assertLess(len(mem.view.parts), 60)
+        seen = []
+        def down(i, n):
+            if n == 1:
+                seen.append(i)
+                return
+            ct.zoom(self.state, i, n)
+            down(i, n // 2)
+            down(i + n // 2, n // 2)
+        for l, i in mem.view.parts:
+            down(i << l, 1 << l)
+        self.assertEqual(seen, list(range(60)))
 
     def test_pending_long_message_shows_its_head(self):
         text = 'a' + 'é' * 400   # 801 bytes; byte 300 falls inside a 2-byte character

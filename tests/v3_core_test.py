@@ -49,6 +49,11 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(one[0][6:], ("2026-01-02", None, "2026-01-02"))  # valid_from, valid_to, recorded_at... column order below
         db.close()
 
+    def test_ingest_survives_evidence_mark_failure(self):
+        with mock.patch.object(core.evidence, "mark", side_effect=RuntimeError("boom")):
+            out = self.c.ingest("a note whose verdict fails")
+        self.assertTrue(out[0]["id"])
+
     def test_update_closes_old_and_as_of(self):
         old = self.c.ingest({"kind": "decision", "text": "use postgres for the store", "why": "w", "valid_from": "2026-01-01"})[0]["id"]
         res = self.c.update(old, {"text": "use sqlite for the store", "why": "w", "valid_from": "2026-06-01"})
@@ -245,10 +250,10 @@ class ReflectTest(unittest.TestCase):
         dup = self.rec("never use tabs please")
         opus = chatlog.append(self.state, [{"kind": "user", "text": "subagents on opus for the hard design work", "date": self.DAY + "T11:00:00+00:00", "src": "claude"}])[0]["i"]
         self.answer = {"stale": [{"id": pref, "by": opus, "quote": "subagents on opus for the hard", "why": "opus asked"}],
-                       "duplicates": [{"ids": [usr, dup], "text": "never use tabs"}], "unsupported": [{"id": pref}]}
+                       "duplicates": [{"ids": [usr, dup], "text": "never use tabs"}]}
         res = self.c.reflect(kind="dream", day=self.DAY)
         self.assertEqual((res["closed"], res["merged"], res["marked"]), ([], [], []))
-        self.assertEqual({p["verdict"] for p in res["proposals"]}, {"stale", "duplicates", "unsupported"})
+        self.assertEqual({p["verdict"] for p in res["proposals"]}, {"stale", "duplicates"})
         for r in (pref, usr):
             self.assertIsNone(self.get(r).get("valid_to"))
             self.assertNotIn("unverified", self.get(r))
@@ -263,10 +268,10 @@ class ReflectTest(unittest.TestCase):
 
     def test_every_owner_clause_is_proposal_only(self):
         origin, quote = self._owner_variants()
-        self.answer = {"unsupported": [{"id": origin}], "stale": [{"id": quote, "by": self.msgs[0], "quote": "sqlite for the store"}]}
+        self.answer = {"stale": [{"id": quote, "by": self.msgs[0], "quote": "sqlite for the store"}]}
         res = self.c.reflect(kind="dream", day=self.DAY)
         self.assertEqual((res["marked"], res["closed"]), ([], []))
-        self.assertEqual({p["id"] for p in res["proposals"]}, {origin, quote})
+        self.assertEqual({p["id"] for p in res["proposals"]}, {quote})
 
     def test_duplicate_with_owner_on_either_side_is_a_proposal(self):
         usr, dup = self.rec("never use tabs", day="2026-09-02", user=True), self.rec("never use tabs please")
@@ -305,7 +310,7 @@ class ReflectTest(unittest.TestCase):
 
     def test_malformed_answer_skips_the_batch(self):
         ok = self.rec("always deploy on fridays")
-        for bad in ({"unsupported": [{"id": ["x"]}]}, {"duplicates": [{"ids": [["a"], ["b"]]}]}, {"stale": [{"id": ok, "by": [1]}]}, ["x"]):
+        for bad in ({"duplicates": [{"ids": [["a"], ["b"]]}]}, {"stale": [{"id": ok, "by": [1]}]}, ["x"]):
             self.answer = bad
             res = self.c.reflect(kind="dream", day=self.DAY)
             self.assertEqual((res["marked"], res["merged"], res["closed"]), ([], [], []))
@@ -314,11 +319,12 @@ class ReflectTest(unittest.TestCase):
 
     def test_one_pass_alone_only_proposes(self):
         bad = self.rec("always deploy on fridays")
-        answers = [{"unsupported": [{"id": bad, "why": "x"}]}, {}]
+        other = self.rec("never deploy on mondays")
+        answers = [{"duplicates": [{"ids": [bad, other], "text": "deploy rules"}]}, {}]
         with mock.patch.object(llm, "RUNNER", lambda system, payload, vault=None: (json.dumps(answers.pop(0)), 0.0, None)):
             res = self.c.reflect(kind="dream", day=self.DAY)
-        self.assertEqual((res["marked"], [p["agreed"] for p in res["proposals"]]), ([], [False]))
-        self.assertNotIn("unverified", self.get(bad))
+        self.assertEqual((res["merged"], [p["agreed"] for p in res["proposals"]]), ([], [False]))   # one pass alone only proposes
+        self.assertNotIn("valid_to", self.get(bad))
 
     def test_branch_call_has_full_messages_second_pass_reversed_and_model_check(self):
         import memrove_v3_reflect as dream
@@ -329,16 +335,17 @@ class ReflectTest(unittest.TestCase):
 
         def runner(system, payload, vault=None, model=None):
             seen.append((model, json.loads(payload)))
-            return json.dumps({"unsupported": [{"id": a}]} if model != "sonnet" else {}), 0.0, None
+            return json.dumps({"duplicates": [{"ids": [a, b], "text": "deploy rules"}]} if model != "sonnet" else {}), 0.0, None
         with mock.patch.object(llm, "RUNNER", runner):
             res = self.c.reflect(kind="dream", day=self.DAY, check_model="sonnet")
         self.assertEqual([m for m, _ in seen], [None, None, "sonnet"])
         self.assertIn(long, [m["text"] for m in seen[0][1]["MESSAGES"]])   # no cut
         ids = lambda k: [r["id"] for r in seen[k][1]["RECORDS"]]
         self.assertEqual(ids(0), ids(1)[::-1])   # pass B sees the other order
-        self.assertEqual(res["marked"], [a])
-        self.assertEqual(res["agree"]["unsupported"], {"AB": [1, 0, 0], "AC": [0, 1, 0], "BC": [0, 1, 0]})
+        self.assertEqual(len(res["merged"]), 1)
+        self.assertEqual(res["agree"]["duplicates"], {"AB": [1, 0, 0], "AC": [0, 1, 0], "BC": [0, 1, 0]})
         self.assertEqual(len(res["branches"]), 1)
+        self.rec("never deploy on sundays")   # the first two were merged away
         with mock.patch.object(dream, "MAX_PAYLOAD", 100), mock.patch.object(llm, "RUNNER", runner):
             self.assertIn("nothing cut", self.c.reflect(kind="dream", day=self.DAY)["errors"][0])   # a too-big branch is skipped, never trimmed
 
@@ -382,11 +389,12 @@ class ReflectTest(unittest.TestCase):
         self.assertEqual(self.get(rid)["valid_to"], "2026-10-08")
 
     def test_dry_run_changes_nothing(self):
-        bad = self.rec("always deploy on fridays")
-        self.answer = {"unsupported": [{"id": bad}]}
+        bad, other = self.rec("always deploy on fridays"), self.rec("never deploy on mondays")
+        self.answer = {"duplicates": [{"ids": [bad, other], "text": "deploy rules"}]}
+        before = self.get(bad)   # ingest already marked it (write-time evidence); a dry run must leave it as it was
         res = self.c.reflect(kind="dream", day=self.DAY, dry=True)
-        self.assertEqual(res["marked"], [bad])
-        self.assertNotIn("unverified", self.get(bad))
+        self.assertEqual(res["merged"], [{"ids": [bad, other], "id": None}])
+        self.assertEqual(self.get(bad), before)
 
     def test_stale_needs_a_real_contradiction(self):
         old = self.rec("use postgres for the store", day="2026-09-01")
@@ -399,8 +407,7 @@ class ReflectTest(unittest.TestCase):
 
     def test_marks_survive_rebuild_and_sync_keeps_store_state(self):
         bad = self.rec("always deploy on fridays")
-        self.answer = {"unsupported": [{"id": bad, "why": "w"}]}
-        self.c.reflect(kind="dream", day=self.DAY)
+        self.c._patch(bad, "reflect", unverified=True, reflect={"day": self.DAY, "verdict": "unsupported", "why": "w"})
         old = self.rec("use postgres for the store", day="2026-09-01")
         self.c.update(old, {"text": "use sqlite for the store", "valid_from": "2026-09-05"})
         old2, new2 = self.rec("use mysql for the store", day="2026-09-01"), self.rec("use redis for the cache", day="2026-09-01")
@@ -422,13 +429,9 @@ class ReflectTest(unittest.TestCase):
         self.assertEqual(c2.expand(old2)["record"]["valid_to"], "2026-09-06")
         self.assertTrue(c2.expand(new2)["record"]["unverified"])
 
-    def test_unsupported_is_marked_not_deleted_and_never_a_rule(self):
+    def test_unverified_mark_is_never_a_rule(self):
         bad, ok = self.rec("always deploy on fridays"), self.rec("use sqlite for the store")
-        self.answer = {"unsupported": [{"id": bad, "why": "no message says it"}, {"id": "rec:ghost"}]}
-        res = self.c.reflect(kind="dream", day=self.DAY)
-        self.assertEqual(res["marked"], [bad])
-        self.assertTrue(self.get(bad)["unverified"])
-        self.assertNotIn("unverified", self.get(ok))
+        self.c._patch(bad, "reflect", unverified=True, reflect={"day": self.DAY, "verdict": "unsupported"})
         import memrove_v3_rules as rules
         self.assertFalse(rules._live(self.get(bad)))
         self.assertTrue(rules._live(self.get(ok)))
