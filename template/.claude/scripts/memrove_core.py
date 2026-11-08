@@ -3,6 +3,8 @@ Stdlib only, no LLM call. Design: personal-intelligence/docs/design/2026-11-07-m
 scope = {space, project, agent, session, tags}. Hit = {id, text, score, arm, evidence:[{kind, ref}], valid_from, valid_to, origin}.
 Evidence is a list but only kind "msg" (a chat-log message id) is built: memrove stores no code and links no code (owner, 2026-11-07)."""
 import json
+import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -13,6 +15,8 @@ import memrove_v3_chatlog as chatlog  # noqa: E402
 import memrove_v3_chatsearch as cs  # noqa: E402
 import memrove_v3_graph as graph  # noqa: E402
 import memrove_v3_outcomes as outcomes  # noqa: E402
+import memrove_v3_relate as relate  # noqa: E402
+import memrove_v3_secrets as secrets  # noqa: E402
 from memrove_v3 import is_forgotten, text_hash  # noqa: E402
 from memrove_v3_sync import SyncEngine  # noqa: E402
 
@@ -28,6 +32,54 @@ def _del(db, sql, args):
         return db.execute(sql, args).rowcount
     except sqlite3.OperationalError:  # table not created in this store
         return 0
+
+
+_LIVE_BAD = ("deleted_by_user", "retired", "merged")
+_PRIVATE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+|https?://\S*\?\S|/(?:Users|home)/\w|~/")
+
+
+def _private(text, state):
+    """True if text must not leave the machine: redaction changes it, or it holds an email, a URL with a query or a home path."""
+    return secrets.redact(text, state)[0] != text or bool(_PRIVATE.search(text))
+
+
+def relate_new(core, rec):
+    """Typed edges from a just-written live record to its 3 nearest older live ones (lexical overlap). Off unless MEMROVE_RELATE=1;
+    decider "none" (nothing sent) unless MEMROVE_RELATE_REMOTE=1 too, then pairs with secrets/emails/query URLs/home paths are skipped. Never raises.
+    -> supersedes proposals [{src, dst, why}], also appended to state/reflect-proposals.jsonl. core.relate_decider: name or callable."""
+    if os.environ.get("MEMROVE_RELATE") != "1" or not rec.get("id"):
+        return []
+    remote = os.environ.get("MEMROVE_RELATE_REMOTE") == "1"
+    live = lambda r: not r.get("valid_to") and r.get("status") not in _LIVE_BAD
+    try:
+        with core.store._connect() as db:  # read only: no write transaction may be open while a decider does network calls
+            rows = [json.loads(p) for _, p in db.execute("SELECT id, payload FROM records WHERE id != ?", (rec["id"],))]
+            me = json.loads(db.execute("SELECT payload FROM records WHERE id=?", (rec["id"],)).fetchone()[0])
+        if not live(me):
+            return []
+        new = {"id": me["id"], "text": me["text"], "valid_from": me.get("valid_from")}
+        older = [{"id": r["id"], "text": r["text"], "valid_from": r.get("valid_from")} for r in rows if live(r) and str(r.get("valid_from") or "") <= str(new["valid_from"] or "")]
+        top = sorted(older, key=lambda o: relate.overlap(o["text"], new["text"])[0], reverse=True)[:3]  # shortcut: full scan, upgrade to FTS at ~10k records
+        if remote:
+            top = [o for o in top if not (_private(o["text"], core.state) or _private(new["text"], core.state))]
+        decider = getattr(core, "relate_decider", None) or ("jev" if remote else "none")
+        res = relate.relate(None, [(o, new) for o in top], decider=decider, remote_ok=remote, write=False)
+        edges = [r for r in res if r["status"] == "edge"]
+        if edges:  # one short write transaction, after all decisions
+            name = decider if isinstance(decider, str) else getattr(decider, "__name__", "custom")
+            with core.store._connect() as db:
+                for r in edges:
+                    relate.write_edge(db, r, new["valid_from"], name)
+        props = [{"src": r["src"], "dst": r["dst"], "why": r["why"]} for r in res if r["status"] == "proposed"]
+        if props:
+            ts = datetime.now(timezone.utc).isoformat()
+            with (Path(core.state) / "reflect-proposals.jsonl").open("a", encoding="utf-8") as f:
+                for p in props:  # line shape of memrove_v3_reflect._propose: day, verdict, id (+ extras)
+                    f.write(json.dumps({"day": ts[:10], "verdict": "supersedes", "id": p["src"], **p, "by": "relate", "ts": ts}, ensure_ascii=False) + "\n")
+        return props
+    except Exception as e:  # never raises; class name only, the text may hold a key
+        print(f"memrove: relate failed: {type(e).__name__}", file=sys.stderr)
+        return []
 
 
 class Core:
@@ -54,6 +106,7 @@ class Core:
             out.append(remember(self.sync, it.get("kind", "note"), it["text"], why=it.get("why"), project=it.get("project") or scope.get("project"),
                                 session=scope.get("session"), source=it.get("source", "memrove-core"), topic=it.get("topic"),
                                 valid_from=it.get("valid_from"), agent=scope.get("agent") or DEFAULT_AGENT, user=bool(it.get("user"))))
+            out[-1]["proposals"] = relate_new(self, out[-1])
         return out
 
     def _one(self, db, rid):
@@ -81,7 +134,7 @@ class Core:
             with self.store._connect() as db:
                 db.execute("UPDATE records SET payload=? WHERE id=?", (body, oid))
                 db.execute("INSERT INTO events(event_type,record_id,revision,record) VALUES ('close',?,?,?)", (oid, old.get("revision", 1), body))
-        return {**res, "closed": oid if supersedes else None}
+        return {**res, "closed": oid if supersedes else None, "proposals": relate_new(self, res)}
 
     def forget(self, target, mode="tombstone"):
         """target: record id (prefix ok) or a scope dict (project/session/agent, at least one). tombstone keeps the row (status deleted_by_user, valid_to set).

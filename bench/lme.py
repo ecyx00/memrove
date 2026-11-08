@@ -46,6 +46,11 @@ def scored(items):
 
 def bm25_order(docs, query, k1=1.5, b=0.75, eps=0.25):
     """rank_bm25.BM25Okapi re-implemented; docs and query are token lists, tokens from str.split(' '). -> doc indexes best first, ties: later doc first."""
+    sc = bm25_scores(docs, query, k1, b, eps)
+    return sorted(range(len(docs)), key=lambda i: (-sc[i], -i))
+
+
+def bm25_scores(docs, query, k1=1.5, b=0.75, eps=0.25):
     n = len(docs)
     freqs, df, total = [], {}, 0
     for d in docs:
@@ -73,7 +78,7 @@ def bm25_order(docs, query, k1=1.5, b=0.75, eps=0.25):
         for i, f in enumerate(freqs):
             if q in f:
                 sc[i] += idf[q] * f[q] * (k1 + 1) / (f[q] + k1 * (1 - b + b * len(docs[i]) / avg))
-    return sorted(range(n), key=lambda i: (-sc[i], -i))
+    return sc
 
 
 def sessions_of(turn_ids):
@@ -135,6 +140,31 @@ def qdate(it):
     return date(int(y), int(m), int(d))
 
 
+def mem0_open(d, collection="bench"):
+    """Mem0 in raw mode: local HF embedder, local qdrant under d, history db under d. The llm block only satisfies the constructor; add(infer=False) never calls it."""
+    os.environ["MEM0_TELEMETRY"] = "False"
+    from mem0 import Memory
+    return Memory.from_config({
+        "embedder": {"provider": "huggingface", "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}},
+        "vector_store": {"provider": "qdrant", "config": {"path": f"{d}/q", "collection_name": collection, "embedding_model_dims": 384, "on_disk": True}},
+        "llm": {"provider": "openai", "config": {"api_key": "unused-never-called"}},
+        "history_db_path": f"{d}/h.db"})
+
+
+def arm_mem0_raw(it, work):
+    """Same corpus as memrove-chatlog (every turn, both roles), ranked by Mem0's vector search."""
+    allt = [f"{sid}_{n}" for sid, sess in zip(it["haystack_session_ids"], it["haystack_sessions"]) for n, _ in enumerate(sess, 1)]
+    texts = [t["content"] for sess in it["haystack_sessions"] for t in sess]
+    with tempfile.TemporaryDirectory(dir=work, prefix="mem0-") as d:
+        m = mem0_open(d)
+        for i, x in enumerate(texts):
+            m.add(x, user_id="u", infer=False, metadata={"i": i})
+        rows = m.search(it["question"], filters={"user_id": "u"}, limit=TOP)["results"]
+        del m
+    ids = [allt[r["metadata"]["i"]] for r in rows]
+    return {"turns": ids, "sessions": sessions_of(ids), "texts": [r["memory"] for r in rows[:5]]}
+
+
 OTHER = [""]   # the next question, set by the caller: a prompt unrelated to this haystack
 
 
@@ -192,7 +222,7 @@ def autorecall_report(items, results, count, thresholds, chosen, max_lines=None,
         print(f"| {th}{mark} | {100 * ev / n:.1f} | {100 * ans / nans:.1f} (n={nans}) | {statistics.median(toks):.0f} | {pct(toks, 0.9)} | {100 * sum(t == 0 for t in toks) / n:.1f} | {100 * fp / n:.1f} |")
 
 
-ARMS = {"bm25-turn": arm_bm25_turn, "bm25-session": arm_bm25_session, "memrove-chatlog": arm_memrove_chatlog, "memrove-autorecall": arm_memrove_autorecall}
+ARMS = {"bm25-turn": arm_bm25_turn, "bm25-session": arm_bm25_session, "memrove-chatlog": arm_memrove_chatlog, "memrove-autorecall": arm_memrove_autorecall, "mem0-raw": arm_mem0_raw}
 
 
 def make_counter():
