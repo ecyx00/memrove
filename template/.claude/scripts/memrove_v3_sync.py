@@ -14,7 +14,7 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from memrove_v3 import MemoryStore, RevisionConflict, VISIBILITY, _json
+from memrove_v3 import MemoryStore, RevisionConflict, VISIBILITY, _json, is_forgotten
 from memrove_v3_links import Links
 from memrove_v3_projections import OWNED, project_record, split_user_note
 from memrove_v3_preferences import read as read_preferences
@@ -390,6 +390,7 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
                     db.execute("DELETE FROM records WHERE id=?", (rid,))
                     deleted += 1
                 db.execute("DELETE FROM markdown_sources WHERE id=?", (rid,))
+            records = {k: v for k, v in records.items() if not is_forgotten(db, dict(v, id=k))}  # hard-forgotten: never comes back
             for rid, record in records.items():
                 row = db.execute("SELECT payload FROM records WHERE id=?", (rid,)).fetchone()
                 before = json.loads(row[0]) if row else None
@@ -400,6 +401,8 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
                     record["revision"] = max(record["revision"], before["revision"] + changed)
                 if rid in self._overridden:
                     record = project_record(self, record)
+                if before and before.get("valid_to") and not record.get("valid_to"):
+                    record["valid_to"] = before["valid_to"]  # a close (Core.update) is store state; a file rebuild must not reopen it
                 payload = _json(record)  # canonical form, comparable with the stored one
                 if row and rid not in owned and row[0] != payload:
                     conflicts.append({"id": rid, "reason": "id already owned by another record"})

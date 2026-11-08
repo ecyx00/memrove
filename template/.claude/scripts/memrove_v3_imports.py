@@ -89,7 +89,8 @@ def scored(state, q, since, until, top, cand=200, prefix=0.6):
     path = chatlog.root(state) / "imports.db"
     if not path.exists():
         return []
-    db = sqlite3.connect(path, timeout=30)
+    import memrove_v3_chatsearch as cs
+    db = sqlite3.connect(path, timeout=cs.BUSY)   # lane_text lowers BUSY: a locked imports.db must not stall the hook
     try:
         where, args = [], []
         if q:

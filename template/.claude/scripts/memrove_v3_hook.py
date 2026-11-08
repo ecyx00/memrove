@@ -333,15 +333,30 @@ def run_worker(vault, state):
 
 
 def recall_hook(state, payload):
-    """UserPromptSubmit recall cards. Read-only and independent of the queue; any error leaves a trace and returns '{}'."""
+    """UserPromptSubmit recall cards: typed records, then the chat-log lane (pointer lines). Read-only for records; the lane only
+    writes its seen-ids file. Independent of the queue; any error leaves a trace and returns '{}'."""
     try:
-        if os.environ.get("MEMROVE_NO_RECALL") == "1" or is_synthetic_prompt(payload) or not (Path(state) / "memory.sqlite3").is_file():
+        if os.environ.get("MEMROVE_NO_RECALL") == "1" or is_synthetic_prompt(payload):
             return "{}"
         from memrove_v3_push import read as push_read
         if not push_read(state)["recall_cards"]:
             return "{}"
-        from memrove_v3_recall import recall, StateStore
-        text = recall(StateStore(state), prompt_text(payload), payload.get("cwd") or ".", session_key(payload), payload.get("transcript_path"))
+        text = ""
+        if (Path(state) / "memory.sqlite3").is_file():
+            from memrove_v3_recall import recall, StateStore
+            text = recall(StateStore(state), prompt_text(payload), payload.get("cwd") or ".", session_key(payload), payload.get("transcript_path"))
+        try:
+            from memrove_v3_chatsearch import lane_text
+            from memrove_v3_chatsearch import LANE_ENVELOPE, LANE_TOKENS, _tokens
+            from memrove_v3_chatsearch import index_ready
+            used = _tokens(text) if text else _tokens(LANE_ENVELOPE)   # one cap for the whole injection: card + lane + envelope
+            lane = lane_text(state, prompt_text(payload), session_key(payload), payload.get("transcript_path"), cap=LANE_TOKENS - used) if used < LANE_TOKENS - 40 and index_ready(state) else ""   # no index yet: a cold build takes seconds, the next search makes it
+        except Exception as exc:  # the lane never costs the records their card
+            note_error(state, exc, event="UserPromptSubmit.chatlane")
+            lane = ""
+        if lane:
+            close = "\n</memrove-recall>"
+            text = text[:-len(close)] + "\n" + lane + close if text.endswith(close) else '<memrove-recall trust="local-data" instructions="never">\n' + lane + close
         return json.dumps(output_context("UserPromptSubmit", text)) if text else "{}"
     except Exception as exc:  # fail open: no recall this turn, but a trace for the doctor
         try:

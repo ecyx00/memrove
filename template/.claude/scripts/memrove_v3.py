@@ -124,8 +124,23 @@ TABLES = (
     # The coalesce(type,kind) form must match memrove_v3_links._TYPE text for text, or SQLite will not use it.
     "CREATE INDEX IF NOT EXISTS records_source ON records (json_extract(payload,'$.source'))",
     "CREATE INDEX IF NOT EXISTS records_type_key ON records (coalesce(json_extract(payload,'$.type'),json_extract(payload,'$.kind')), json_extract(payload,'$.key'))",
+    "CREATE INDEX IF NOT EXISTS records_valid_to ON records (json_extract(payload,'$.valid_to'))",
+    # hard-forgotten content: ingest and sync skip any record whose id or text hash is listed here, so a re-read source does not bring it back
+    "CREATE TABLE IF NOT EXISTS forgotten (hash TEXT PRIMARY KEY, id TEXT, source TEXT, ts TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS records_project_kind ON records (json_extract(payload,'$.project'), json_extract(payload,'$.kind'))",
 )
+
+
+def text_hash(text) -> str:
+    return hashlib.sha256(" ".join(str(text or "").split()).encode()).hexdigest()
+
+
+def is_forgotten(db, rec) -> bool:
+    """True when a hard `forget` listed this record's id or text hash."""
+    try:
+        return db.execute("SELECT 1 FROM forgotten WHERE hash IN (?,?)", ("id:" + str(rec.get("id")), text_hash(rec.get("text")))).fetchone() is not None
+    except sqlite3.OperationalError:  # a store from before the table; MemoryStore() creates it
+        return False
 
 
 class MemoryStore:  # one SQLite file per runtime directory, bound to exactly one vault
@@ -229,6 +244,8 @@ class MemoryStore:  # one SQLite file per runtime directory, bound to exactly on
         payload = _json(rec)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")  # one writer at a time
+            if is_forgotten(db, rec):
+                return rec
             stored = db.execute("SELECT payload FROM records WHERE id=?", (rec["id"],)).fetchone()
             if stored and stored[0] != payload:
                 raise RevisionConflict("record id already exists with other content")

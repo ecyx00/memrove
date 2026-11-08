@@ -127,6 +127,18 @@ def graph_visible(r):
 def ensure(db):
     for sql in SCHEMA:
         db.execute(sql)
+    migrate(db)
+
+
+def migrate(db):
+    """Bi-temporal columns on graph_edges (idempotent): valid_from/valid_to = event time, recorded_at = system time; old rows backfill from ts."""
+    have = {r[1] for r in db.execute('PRAGMA table_info(graph_edges)')}
+    for col in ('valid_from', 'valid_to', 'recorded_at'):
+        if col not in have:
+            db.execute(f'ALTER TABLE graph_edges ADD COLUMN {col} TEXT')
+    db.execute('UPDATE graph_edges SET valid_from=ts WHERE valid_from IS NULL')
+    db.execute('UPDATE graph_edges SET recorded_at=ts WHERE recorded_at IS NULL')
+    db.execute('CREATE INDEX IF NOT EXISTS ge_src_type_from ON graph_edges(src, type, valid_from)')
 
 
 def now():
@@ -156,7 +168,7 @@ def add_edge(db, src, dst, type, why, prov):
         raise ValueError('an edge needs a why (one sentence)')
     if src == dst:
         raise ValueError('an edge needs two different nodes')
-    db.execute('INSERT OR REPLACE INTO graph_edges VALUES (?,?,?,?,?,?)', (src, dst, type, why, json.dumps(prov, ensure_ascii=False, sort_keys=True), prov['at']))
+    db.execute('INSERT OR REPLACE INTO graph_edges(src,dst,type,why,prov,ts,valid_from,recorded_at) VALUES (?,?,?,?,?,?,?,?)', (src, dst, type, why, json.dumps(prov, ensure_ascii=False, sort_keys=True), prov['at'], prov['at'], prov['at']))
 
 
 def add_concept(db, name, why, prov):

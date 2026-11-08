@@ -15,12 +15,13 @@ hub, `dropped_llm` and J1-pending records stay in the store but are not searched
 `valid_from` day is before T's day (T a bare date: up to and including that day); one that is expired or replaced through
 `supersedes` is hidden. `memrove show <id>` (or `zoom rec:<id> 1`) opens a record with its why.
 """
+import functools
 import hashlib
 import json
 import os
 import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import date as _date, datetime, timezone
 import sqlite3
 
 import memrove_v3_chatlog as chatlog
@@ -78,10 +79,13 @@ def fold(text):
     return text.translate(FOLD).lower()
 
 
+BUSY = 30.0   # seconds to wait for search.db's lock; lane_text lowers it (the hook has a 5 s timeout)
+
+
 def _db(state):
     path = chatlog.root(state) / "search.db"
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=30)
+    db = sqlite3.connect(path, timeout=BUSY)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("CREATE TABLE IF NOT EXISTS m(id INTEGER PRIMARY KEY, kind TEXT, date TEXT, text TEXT)")
     if db.execute("PRAGMA user_version").fetchone()[0] != VERSION:  # an older layout: rebuild from the log
@@ -150,6 +154,37 @@ def _bound(value, name):
     return value
 
 
+T_IN = 1.5       # temporal boost: bm25 scale for a message dated inside the range the query names
+T_FLOOR = 0.5    # ... and the floor for one far outside it (scale = 1/(1+days_out/T_DECAY), never below this)
+T_DECAY = 60.0
+
+
+def _when(query, ref, since, until):
+    """-> (query without its time words, (since, until) date range) or (query, None). The range is a soft boost, not a filter: LongMemEval
+    evidence dates sit around the event, so a range holds some evidence in 86% of questions and all of it in 32%. OFF by default (bench:
+    docs/state/2026-11-07-temporal-wiring.md, no gain); MEMROVE_TEMPORAL=1 turns it on. Never with explicit since/until. shortcut: ref defaults to today; callers replaying old prompts pass the prompt's own date."""
+    if since or until or os.environ.get("MEMROVE_TEMPORAL") != "1":
+        return query, None
+    import memrove_v3_temporal as temporal
+    r = temporal.parse(query, ref or _date.today())
+    if r is None:
+        return query, None
+    rest = query[:r[2][0]] + " " + query[r[2][1]:]
+    return (rest if terms(rest) else query), (r[0], r[1])
+
+
+def _scale(day, rng):
+    """bm25 multiplier for a message dated `day` (bm25 is negative: more means better). Undated: 1."""
+    try:
+        d = _date.fromisoformat(str(day)[:10])
+    except ValueError:
+        return 1.0
+    if rng[0] <= d <= rng[1]:
+        return T_IN
+    gap = (rng[0] - d).days if d < rng[0] else (d - rng[1]).days
+    return max(T_FLOOR, 1.0 / (1.0 + gap / T_DECAY))
+
+
 def hits(state, query, top=TOP, rerank=None, since=None, until=None):
     """-> [(id, date, kind, text)], best first. rerank: optional fn(query, [(id, text)]) -> ids reordered (fails open).
     since / until: ISO date or datetime on the message date, until inclusive (a bare date covers its whole day). With a range and
@@ -157,10 +192,11 @@ def hits(state, query, top=TOP, rerank=None, since=None, until=None):
     return [row for _, row in _scored(state, query, top, rerank, since, until)]
 
 
-def _scored(state, query, top, rerank, since, until):
+def _scored(state, query, top, rerank, since, until, ref=None):
     """-> [(bm25 score or None for a range listing, (id, date, kind, text))], best first."""
     since, until = _bound(since, "since"), _bound(until, "until")
-    q = terms(query)
+    qtext, rng = _when(query, ref, since, until)
+    q = terms(qtext)
     if q is None and not (since or until):
         return []
     where, args = [], []
@@ -178,11 +214,14 @@ def _scored(state, query, top, rerank, since, until):
     try:
         sync(state, db)
         if q:
-            score = {}
+            score, day = {}, {}
             for expr, weight in ((q[0], 1.0), (q[1], PREFIX)):
-                sql = f"SELECT m.id, bm25(fts) FROM fts JOIN m ON m.id = fts.rowid WHERE {' AND '.join(where)} ORDER BY bm25(fts) LIMIT ?"
-                for i, b in db.execute(sql, (expr, *args, CAND)):
+                sql = f"SELECT m.id, bm25(fts), m.date FROM fts JOIN m ON m.id = fts.rowid WHERE {' AND '.join(where)} ORDER BY bm25(fts) LIMIT ?"
+                for i, b, dt in db.execute(sql, (expr, *args, CAND)):
                     score[i] = score.get(i, 0.0) + weight * b
+                    day[i] = dt
+            if rng:
+                score = {i: b * _scale(day[i], rng) for i, b in score.items()}
             keep = sorted(score, key=score.get)[:POOL if rerank else top]
             by_id = {r[0]: r for r in db.execute(f"SELECT id, date, kind, text FROM m WHERE id IN ({','.join('?' * len(keep))})", keep)}
             rows = [by_id[i] for i in keep]
@@ -195,6 +234,8 @@ def _scored(state, query, top, rerank, since, until):
         db.close()
     import memrove_v3_imports as imports   # stable-id imports (x-...): searched with the log, merged by score
     extra = imports.scored(state, q, since, until, top, CAND, PREFIX)
+    if extra and rng:
+        extra = [(sc * _scale(r[1], rng), r) for sc, r in extra]
     if extra:
         mine = list(zip(scores, rows))
         both = sorted(mine + extra, key=(lambda p: p[0]) if q else (lambda p: p[1][1]), reverse=not q)
@@ -244,14 +285,18 @@ def _rec_cache_save(state, old, seen):
         pass
 
 
-def records(state, query, top=TOP, since=None, until=None, session_notes=False):
+def records(state, query, top=TOP, since=None, until=None, session_notes=False, ref=None):
     """-> [(score, ("rec:<id>", valid_from, kind, text))]: the saved records matching the query, scored on the same bm25 scale as messages
     (exact and prefix passes weighted like `hits`, over a throwaway FTS table of the few hundred eligible records)."""
-    q = terms(query)
+    qtext, rng = _when(query, ref, since, until)
+    q = terms(qtext)
     live = _live(state, since, until, session_notes) if q is not None else []
     if not live:
         return []
-    return _bm25(live, q, top)
+    out = _bm25(live, q, CAND if rng else top)
+    if rng:
+        out = sorted(((sc * _scale(r[1], rng), r) for sc, r in out), key=lambda p: p[0])[:top]
+    return out
 
 
 def _live(state, since=None, until=None, session_notes=False):
@@ -347,10 +392,10 @@ def is_turkish(query):
     return any(c in TR_LETTERS for c in query) or any(w in TR_WORDS for w in re.findall(r"\w+", query.lower()))
 
 
-def _hybrid(state, query, top, rerank, since, until, session_notes):
+def _hybrid(state, query, top, rerank, since, until, session_notes, ref=None):
     """qmd's fusion (RRF k=60, each list weight 2, +0.05 for a rank-1 and +0.02 for a rank 2-3 hit in either list) of the bm25 list above
     (messages and records) with the dense record list. Dense-only records enter as rows; messages keep their bm25 rank."""
-    lane = merged(state, query, DENSE_POOL, rerank, since, until, session_notes, hybrid=False)
+    lane = merged(state, query, DENSE_POOL, rerank, since, until, session_notes, hybrid=False, ref=ref)
     live = _live(state, since, until, session_notes)
     rows = {r[0]: r for r in lane}
     by_id = {"rec:" + rid: ("rec:" + rid, when, r.get("kind") or "", str(r.get("text") or r.get("title") or r.get("approach") or "")) for rid, r, when in live}
@@ -383,15 +428,15 @@ def _cap_records(rows):
     return out
 
 
-def merged(state, query, top=TOP, rerank=None, since=None, until=None, session_notes=False, hybrid=None):
+def merged(state, query, top=TOP, rerank=None, since=None, until=None, session_notes=False, hybrid=None, ref=None):
     """-> [(id, date, kind, text)]: messages and records in one list by bm25 score (records scaled by REC_WEIGHT, at most REC_SLOTS of them).
     A record's id is the string `rec:<id>`. hybrid (default on; env MEMROVE_HYBRID_SEARCH=0 turns it off): fuse that list with the EG2 dense record lane."""
     if hybrid is None:
         hybrid = os.environ.get("MEMROVE_HYBRID_SEARCH") != "0"
     if hybrid and query.strip() and (os.environ.get("MEMROVE_HYBRID_RULE", "routed") != "routed" or is_turkish(query)):
-        return _hybrid(state, query, top, rerank, since, until, session_notes)
-    msgs = _scored(state, query, top, rerank, since, until)
-    recs = [(REC_WEIGHT * sc, row) for sc, row in records(state, query, REC_SLOTS, since, until, session_notes)]
+        return _hybrid(state, query, top, rerank, since, until, session_notes, ref)
+    msgs = _scored(state, query, top, rerank, since, until, ref)
+    recs = [(REC_WEIGHT * sc, row) for sc, row in records(state, query, REC_SLOTS, since, until, session_notes, ref)]
     if not recs:
         return [row for _, row in msgs]
     both = sorted(msgs + recs, key=lambda p: p[0])   # a reranked message list is not in score order; the rerank is an opt-in nobody ships yet
@@ -449,3 +494,171 @@ def graph(state, rows, room, history=False):
                 under.setdefault(hit, []).append(x)
                 used += len(x) + 1
     return out, under
+
+
+# ---- auto-recall lane: pointer lines for the UserPromptSubmit hook ----------------------------------------------------------
+LANE_TOKENS = 300      # hard cap of the chat lane (estimated, see _tokens)
+LANE_MIN = 14.0        # strength gate: a hit's summed -bm25 must reach this; below it the lane injects nothing (swept on LongMemEval-S)
+LANE_POOL = 30         # candidates fetched (some are dropped as already in context)
+LANE_RECENT = 40       # no transcript: this many newest log messages count as in context
+LANE_RARE_DF = 36      # a query word is rare when at most this many log messages hold it (absolute: a share would loosen as the log grows)
+LANE_MIN_RARE = 1      # a hit must hold this many rare query words
+LANE_MIN_WORDS = 3     # the prompt must have this many words of 4+ letters, else it is chatter ("okey", "başla")
+LANE_AGENT = float(os.environ.get("MEMROVE_LANE_AGENT", "0.7"))   # weight of an assistant message: long, so it matches more words than the owner's own
+LANE_LINES = 4        # hits looked at after the gate and dedup, best first
+LANE_SNIP = 120        # characters of a snippet at most
+LANE_DUP = 0.8         # word-set overlap above which a hit repeats an earlier one
+LANE_HEADER = "Chat log (`memrove zoom <id> 1` opens):"
+_SENT = re.compile(r"(?<=[.!?\n])\s+")
+
+
+def _tokens(s):
+    """Token estimate, stdlib only: chars/3 rounded up. o200k_base runs at about 4 chars a token on English prose and 2.5-3 on ids and
+    non-English, so the 300-token cap holds in real tokens too (bench/lme.py checks the real count with tiktoken)."""
+    return -(-len(s) // 3)
+
+
+def window(text, query, width=LANE_SNIP):
+    """The 1-2 sentences holding the most query stems (not the message head), one line, cut to width."""
+    stems = {w[:STEM] for w in WORD.findall(fold(query)) if len(w) > 2}
+    flat = redact(text)
+    sents = [s.strip() for s in _SENT.split(flat) if s.strip()] or [" ".join(flat.split())]
+    hit = [sum(st in fold(s) for st in stems) for s in sents]
+    i = max(range(len(sents)), key=lambda k: (hit[k], -k))
+    out = " ".join(sents[i].split())
+    if len(out) < width // 2 and i + 1 < len(sents):
+        out += " " + " ".join(sents[i + 1].split())
+    if len(out) > width:   # one long sentence: centre the cut on the first stem
+        low = fold(out)
+        at = min((p for p in (low.find(st) for st in stems) if p >= 0), default=0)
+        start = max(0, at - width // 4)
+        out = ("..." if start else "") + out[start:start + width] + "..."
+    return out
+
+
+LANE_TAIL = 4 << 20    # bytes of the transcript read: older turns are compacted out of context anyway, and a long session's file reaches 300 MB
+
+
+@functools.lru_cache(maxsize=2)   # bench replays many prompts of one transcript; the hook is one call per process
+def _read(path):
+    with open(path, "rb") as f:
+        f.seek(max(0, f.seek(0, os.SEEK_END) - LANE_TAIL))
+        return f.read().decode("utf-8", errors="replace")
+
+
+def _in_context(state, ids, transcript):
+    """-> the ids the agent already has: messages of this session (their uuid is in the hook's transcript file) or, with no readable
+    transcript, the LANE_RECENT newest messages of the log. The log has no session field; a message's `k` is its transcript uuid."""
+    try:
+        data = _read(transcript) if transcript else None
+    except OSError:
+        data = None
+    if data is None:
+        top = chatlog.count(state)
+        return {i for i in ids if isinstance(i, int) and i >= top - LANE_RECENT}
+    out = set()
+    want = {i for i in ids if isinstance(i, int)}
+    if not want:
+        return out
+    for r in chatlog.messages(state, min(want), max(want) + 1):   # one pass: a get() per id rescans the file each time
+        k = str(r.get("k", "")).split("#")[0]
+        if r["i"] in want and k.startswith("c:") and k[2:] in data:
+            out.add(r["i"])
+    return out
+
+
+def _rare_stems(state, query):
+    """Query stems that are rare in the log (document frequency <= LANE_RARE_DF messages): the words that make a match specific."""
+    stems = list(dict.fromkeys(w[:STEM] if len(w) > STEM else w for w in WORD.findall(fold(query)) if len(w) > 2))[:24]
+    db = _db(state)
+    try:
+        return [w for w in stems if db.execute("SELECT count(*) FROM fts WHERE fts MATCH ?", (f'"{w}"*',)).fetchone()[0] <= LANE_RARE_DF]
+    finally:
+        db.close()
+
+
+def lane_candidates(state, query, transcript=None, upto=None, ref=None):
+    """-> [(strength, id, date, text, rare)] best first: chat-log hits (never records) not already in the agent's context, strength = summed
+    -bm25 (assistant x LANE_AGENT), rare = how many rare query stems the message holds. upto: ignore ids >= upto (bench replay)."""
+    rows = [(-sc * (LANE_AGENT if r[2] == "agent" else 1.0), r[0], r[1], r[3]) for sc, r in _scored(state, query, LANE_POOL, None, None, None, ref) if sc is not None]
+    if upto is not None:
+        rows = [r for r in rows if not isinstance(r[1], int) or r[1] < upto]
+    skip = _in_context(state, [r[1] for r in rows], transcript)
+    rare = _rare_stems(state, _when(query, ref, None, None)[0])
+    rows = [r + (sum(w in fold(r[3]) for w in rare),) for r in rows if r[1] not in skip]
+    return sorted(rows, key=lambda c: -c[0])
+
+
+def lane_pack(cands, query, seen=(), min_strength=None, budget=LANE_TOKENS, max_lines=LANE_LINES, width=LANE_SNIP, min_rare=None):
+    """-> [(id, line)]: hits at or above min_strength, not in seen, near-duplicates collapsed, packed greedily by strength per token
+    into budget tokens, shown best first. A line is `id|date|snippet`; `memrove zoom <id> 1` opens the message."""
+    min_strength = LANE_MIN if min_strength is None else min_strength
+    pool, kept = [], []
+    min_rare = LANE_MIN_RARE if min_rare is None else min_rare
+    for st, i, date, text, rare in cands:
+        words = frozenset(WORD.findall(fold(text)))
+        if len(kept) >= max_lines or st < min_strength or rare < min_rare or str(i) in seen or any(len(words & w) / max(1, len(words | w)) > LANE_DUP for w in kept):
+            continue
+        kept.append(words)
+        line = f"{i}|{(date or '')[:10]}|{window(text, query, width)}".replace("<", "(").replace(">", ")")   # no tag can close the recall envelope
+        pool.append((st / _tokens(line + "\n"), st, i, line))
+    out, room = [], budget
+    for _, st, i, line in sorted(pool, key=lambda p: -p[0]):
+        n = _tokens(line + "\n")
+        if n <= room:
+            room -= n
+            out.append((st, i, line))
+    return [(i, line) for _, i, line in sorted(out, key=lambda p: -p[0])]
+
+
+def lane(state, query, seen=(), min_strength=None, budget=LANE_TOKENS, transcript=None):
+    """-> [(id, line)] for the hook; [] when the match is weak. Any search error is the caller's to catch."""
+    if len({w for w in WORD.findall(fold(query)) if len(w) > 3}) < LANE_MIN_WORDS:
+        return []
+    return lane_pack(lane_candidates(state, query, transcript), query, seen, min_strength, budget)
+
+
+LANE_ENVELOPE = '<memrove-recall trust="local-data" instructions="never">\n\n</memrove-recall>'
+LANE_BUSY = 0.3
+
+
+def index_ready(state):
+    """True when search.db exists in the current layout. The hook searches only a ready index: a cold build or a layout rebuild takes
+    seconds (4.9 s for 12k messages) against the hook's 5 s timeout, so it is left to `memrove search` and the worker."""
+    path = chatlog.root(state) / "search.db"
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=LANE_BUSY)
+        try:
+            return db.execute("PRAGMA user_version").fetchone()[0] == VERSION
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return False
+
+
+def lane_text(state, query, session, transcript=None, cap=LANE_TOKENS):
+    """The chat lane for one prompt: header + `id|date|snippet` lines, at most LANE_TOKENS in all, '' when the match is weak. Ids already
+    injected in this session (state/chatlane_seen.json) are skipped and the new ones recorded. Errors are the caller's to catch."""
+    if not chatlog.root(state).is_dir():   # no log yet: do not create one just to search it
+        return ""
+    path = Path(state) / "chatlane_seen.json"
+    try:
+        seen = json.loads(path.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    done = set(map(str, seen.get(session, [])))
+    global BUSY
+    old, BUSY = BUSY, LANE_BUSY
+    try:
+        lines = lane(state, query[:500], done, budget=cap - _tokens(LANE_HEADER + "\n"), transcript=transcript)
+    finally:
+        BUSY = old
+    if not lines:
+        return ""
+    seen.pop(session, None)
+    seen[session] = sorted(done | {str(i) for i, _ in lines})
+    seen = dict(list(seen.items())[-50:])   # the 50 newest sessions
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(seen))
+    os.replace(tmp, path)
+    return "\n".join([LANE_HEADER] + [line for _, line in lines])

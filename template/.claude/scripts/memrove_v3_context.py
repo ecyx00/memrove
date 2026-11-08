@@ -160,7 +160,7 @@ def _retry_locked(sync, fn, budget=120.0):
             pass
 
 
-def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None):
+def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None, valid_from=None, agent=None):
     """Model-written memory: same observe contract (validate, commit, readback), core kinds allowed. Idempotent on (kind, text)."""
     from memrove_v3_capture import has_secret, key_of
     if kind not in REMEMBER_KINDS:
@@ -173,7 +173,7 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
     payload = {"text": text, "origin_type": "user_explicit" if user else "agent_inference",
                "source_item_id": hashlib.sha256(f"{kind}\0{text}".encode()).hexdigest()[:24],
                "status": "active", "confidence": 1.0 if user else 0.7,
-               "valid_from": datetime.now(timezone.utc).date().isoformat(), "key": key_of(text)}
+               "valid_from": valid_from or datetime.now(timezone.utc).date().isoformat(), "key": key_of(text)}
     if user:
         payload["verified_by"] = "user_quote"
     if why:
@@ -182,6 +182,8 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
         payload["project"] = project
     if session:
         payload["session"] = session
+    if agent:
+        payload["agent"] = agent
     if kind == "rejected":
         payload["polarity"] = "neg"
     if check:  # executable memory: dry run now, so a bad check is never stored (7 of 15 first-run failures were bad checks)

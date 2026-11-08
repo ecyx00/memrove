@@ -215,3 +215,16 @@ def backfill(state, info, days=3, dest=None, live=False):
         else:
             os.environ["DECIDE_HOME"] = old
 
+
+
+SIGNALS = ("used", "wrong", "stale")
+
+
+def feedback(rid, signal, reason=""):
+    """Log one feedback row (use memrove.feedback) in the decision log -> its decision id. Log only: nothing reads it for ranking yet."""
+    if signal not in SIGNALS:
+        raise ValueError(f"signal must be one of {list(SIGNALS)}")
+    did = dl.log("memrove.feedback", str(rid), options=list(SIGNALS), answer=signal, source="user", state=" ".join(str(reason or "").split())[:300] or None)
+    if did is None:
+        raise RuntimeError("decision log is off or not writable; feedback not recorded")
+    return did
