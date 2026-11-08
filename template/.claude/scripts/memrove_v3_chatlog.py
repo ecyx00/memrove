@@ -120,18 +120,22 @@ def hide(state, chat=(), imports=()):
     write_json(root(state) / "hidden.json", cur)
 
 
-def read_file(path):
+def read_file(path, want=None):
     skip = hidden(Path(path).parent.parent)
-    for r in _read_all(path):
+    for r in _read_all(path, want):
         if r["i"] not in skip:
             yield r
 
 
-def _read_all(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
+def _read_all(path, want=None):
+    """want: ids to parse; other lines are skipped on their `{"i": N,` prefix (append writes json.dumps, so the prefix is fixed)."""
+    pre = tuple(f'{{"i": {i},'.encode() for i in want) if want else None
+    with open(path, "rb") as f:  # bytes: unwanted lines are skipped without decoding
         for raw in f:
+            if pre and not raw.startswith(pre):
+                continue
             try:
-                r = json.loads(raw)
+                r = json.loads(raw.decode("utf-8", errors="replace"))
             except ValueError:
                 continue  # torn line from a crash
             if isinstance(r, dict) and "i" in r:
@@ -164,6 +168,28 @@ def get(state, i):
     return None
 
 
+def get_many(state, ids):
+    """{id: message} for the ids that exist, one read per day file that holds a wanted id."""
+    want, out = set(ids), {}
+    files = _files(root(state))
+    firsts = []
+    for f in files:
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            try:
+                firsts.append(json.loads(fh.readline()).get("i"))
+            except (ValueError, AttributeError):  # torn or non-object first line: the file's range is unknown
+                firsts.append(None)
+    for n, f in enumerate(files):
+        lo = firsts[n]
+        hi = next((x for x in firsts[n + 1:] if x is not None), None)
+        if lo is None or not any(i >= lo and (hi is None or i < hi) for i in want):
+            continue
+        for r in read_file(f, want):
+            if r["i"] in want:
+                out[r["i"]] = r
+    return out
+
+
 def append(state, items, today=None):
     """Append [{kind, text, date, src?, k?}] under the caller's lock: ids are assigned in order, one write + flush + fsync.
     -> the stored records. A file that does not end in a newline (crash mid-write) gets one first."""
@@ -177,7 +203,7 @@ def append(state, items, today=None):
     for it in items:
         rec = {"i": nxt, "kind": it["kind"], "text": it["text"], "size": len((it["kind"] + ": " + it["text"]).encode("utf-8")),
                "date": it["date"]}
-        for k in ("src", "k", "probe"):
+        for k in ("src", "k", "probe", "proj"):
             if it.get(k):
                 rec[k] = it[k]
         blob.append(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -374,6 +400,19 @@ def source_cwd(src, path, scan=60):
     return None
 
 
+def _project_of(src, path):
+    """Project name of a transcript (for access control), None when its cwd is unknown or resolves to no project. Never raises."""
+    try:
+        cwd = source_cwd(src, path)
+        if cwd is None:
+            return None
+        from memrove_v3_project import project_name
+        n = project_name(cwd)
+        return None if n in (None, "unknown") else n
+    except Exception:
+        return None
+
+
 def opted_out(src, path):
     """True when the transcript's project carries `.memrove/no-memory`: the hook's own convention (memrove_v3_hook.skip_session)."""
     cwd = source_cwd(src, path)
@@ -463,7 +502,8 @@ def ingest(state, home=None, since=None, limit=None, lean_before=None):
         new_cursors[str(path)] = end  # advances for an opted-out file too: it is read once, never logged
         if opted_out(src, path):
             continue
-        cands += [dict(m, src=src, order=n) for m in msgs if not floor or m["ts"] >= floor]
+        proj = _project_of(src, path)
+        cands += [dict(m, src=src, order=n, proj=proj) for m in msgs if not floor or m["ts"] >= floor]
     cands.sort(key=lambda m: (m["ts"], m["order"]))
     stats, items, fresh, pastes = {}, [], [], set()
     for m in cands:
@@ -491,7 +531,7 @@ def ingest(state, home=None, since=None, limit=None, lean_before=None):
         row[1] += len(pieces)
         for j, piece in enumerate(pieces):
             items.append({"kind": m["kind"], "text": piece, "date": m["ts"].isoformat(timespec="seconds"), "src": m["src"],
-                          "k": m["k"] + (f"#{j}" if j else ""), **({"probe": True} if m.get("probe") else {})})
+                          "k": m["k"] + (f"#{j}" if j else ""), **({"probe": True} if m.get("probe") else {}), **({"proj": m["proj"]} if m.get("proj") else {})})
     if limit is not None:
         # keep whole source messages: cut the item list at a message boundary
         keep, seen_k = [], set()

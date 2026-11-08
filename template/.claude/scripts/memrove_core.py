@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import memrove_v3_access as access  # noqa: E402
 import memrove_v3_chatlog as chatlog  # noqa: E402
 import memrove_v3_chatsearch as cs  # noqa: E402
 import memrove_v3_evidence as evidence  # noqa: E402
@@ -54,13 +55,15 @@ def _private(text, state):
     return secrets.redact(text, state)[0] != text or bool(_PRIVATE.search(text))
 
 
-def relate_new(core, rec):
+def relate_new(core, rec, agent=None):
     """Typed edges from a just-written live record to its 3 nearest older live ones (lexical overlap). Off unless MEMROVE_RELATE=1;
     decider "none" (nothing sent) unless MEMROVE_RELATE_REMOTE=1 too, then pairs with secrets/emails/query URLs/home paths are skipped. Never raises.
     -> supersedes proposals [{src, dst, why}], also appended to state/reflect-proposals.jsonl. core.relate_decider: name or callable."""
     if os.environ.get("MEMROVE_RELATE") != "1" or not rec.get("id"):
         return []
     remote = os.environ.get("MEMROVE_RELATE_REMOTE") == "1"
+    if remote and not access.can_remote(access.load(core.state), agent or DEFAULT_AGENT):
+        return []  # the owner asked for remote relate, the policy forbids this agent's text to leave: skip the pass, no decider runs
     live = lambda r: not r.get("valid_to") and r.get("status") not in _LIVE_BAD
     try:
         with core.store._connect() as db:  # read only: no write transaction may be open while a decider does network calls
@@ -116,6 +119,9 @@ class Core:
         """items: [str | {text, kind, why, topic, project, source, valid_from}] -> [{id, status}]. kind defaults to note."""
         from memrove_v3_context import remember
         scope = scope or {}
+        agent = scope.get("agent") or DEFAULT_AGENT
+        if not access.can_write(access.load(self.state), agent):
+            return [{"id": None, "status": "denied"} for _ in ([items] if isinstance(items, (str, dict)) else items)]
         out = []
         for it in ([items] if isinstance(items, (str, dict)) else items):
             it = {"text": it} if isinstance(it, str) else dict(it)
@@ -131,7 +137,7 @@ class Core:
                     evidence.mark(self, out[-1]["id"])  # shortcut: loads the whole chat log per call, pass a cached log= if ingest gets hot
                 except Exception as e:  # a failed verdict must never fail the write; class name only
                     print(f"memrove: evidence mark failed: {type(e).__name__}", file=sys.stderr)
-            out[-1]["proposals"] = relate_new(self, out[-1])
+            out[-1]["proposals"] = relate_new(self, out[-1], agent)
         return out
 
     def _one(self, db, rid):
@@ -274,7 +280,7 @@ class Core:
 
     # ---- read
     def recall(self, query, scope=None, arms=None, k=8, budget_tokens=None, as_of=None, agent=None):
-        """Chat log + records through chatsearch.merged (the 93.1 any@5 lane), as Hits in merged order. arms: subset of {"chat","record"}. as_of: ISO day. agent: only hits written by that agent (chat messages by their source)."""
+        """Chat log + records through chatsearch.merged (the 93.1 any@5 lane), as Hits in merged order. arms: subset of {"chat","record"}. as_of: ISO day. agent: only hits written by that agent (chat messages by their source). scope.session filters records only (chat rows carry no session id). scope.agent unset with an access.json: the policy default applies."""
         scope = scope or {}
         rows = cs.merged(self.state, query, top=k * 4 if agent else k, until=as_of)
         recs = {i.removeprefix("rec:") for i, *_ in rows if isinstance(i, str) and i.startswith("rec:")}
@@ -283,13 +289,21 @@ class Core:
             with self.store._connect() as db:
                 for rid, p in db.execute(f"SELECT id, payload FROM records WHERE id IN ({','.join('?' * len(recs))})", list(recs)):
                     meta[rid] = json.loads(p)
+        cids = {int(i) for i, *_ in rows if str(i).isdigit() and not (isinstance(i, str) and i.startswith("rec:"))}
+        msgs = chatlog.get_many(self.state, cids) if cids else {}  # one read per day file, shared by policy, origin and _by_agent
         hits, used = [], 0
+        reader, policy, sess = scope.get("agent"), access.load(self.state), scope.get("session")
         for rank, (i, date, kind, text) in enumerate(rows):
             r = meta.get(i.removeprefix("rec:")) if isinstance(i, str) else None
             arm = "record" if r is not None else "chat"
+            m = None if r is not None else (msgs.get(int(i)) if str(i).isdigit() else None)
+            if not access.can_read(policy, reader, (r if r is not None else m or {}).get("project" if r is not None else "proj")):
+                continue
+            if sess and r is not None and r.get("session") != sess:  # chat rows carry no session id: a session scope filters records only
+                continue
             if (arms and arm not in arms) or (r is not None and scope.get("project") and r.get("project") != scope["project"]):
                 continue
-            if agent and not self._by_agent(i, r, agent):
+            if agent and not self._by_agent(r, m, agent):
                 continue
             if len(hits) >= k:
                 break
@@ -298,13 +312,13 @@ class Core:
                 break
             hits.append({"id": i, "text": text, "score": 1.0 / (1 + rank), "arm": arm, "evidence": [] if r is not None else [{"kind": "msg", "ref": i}],
                          "valid_from": (r or {}).get("valid_from") or date, "valid_to": (r or {}).get("valid_to"),
-                         "origin": (r or {}).get("agent") or (DEFAULT_AGENT if r is not None else kind)})
+                         "origin": (r or {}).get("agent") or (DEFAULT_AGENT if r is not None else (SRC_AGENT.get(m.get("src"), m.get("src")) if m and m.get("src") else kind))})
         return hits
 
-    def _by_agent(self, i, r, agent):
+    def _by_agent(self, r, m, agent):
         if r is not None:
             return agent_of(r) == agent
-        m = chatlog.get(self.state, int(i)) if str(i).isdigit() else None  # an import id has no source here: fail closed
+        # an import id has no source here (m is None): fail closed
         return bool(m) and SRC_AGENT.get(m.get("src"), m.get("src")) == agent
 
     def as_of(self, t, project=None, kind=None, agent=None):
