@@ -36,6 +36,11 @@ def _rule(policy, agent):
     return r
 
 
+def harness_agent(harness):
+    """Hook harness -> agent name (same mapping as memrove_core.SRC_AGENT: claude -> claude-code; codex is its own name)."""
+    return {"claude": "claude-code"}.get(harness, harness or "claude-code")
+
+
 def can_read(policy, agent, project):
     read = _rule(policy, agent).get("read")
     read = [read] if isinstance(read, str) else (read or [])

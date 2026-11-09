@@ -17,7 +17,9 @@ SCRIPTS = ROOT / "template/.claude/scripts"
 START, END = "<!-- memrove-v3:start -->", "<!-- memrove-v3:end -->"
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "PreCompact", "SessionEnd")
 GLOBAL_EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop", "SessionEnd")
-JIT_EVENTS = (("SubagentStart", None), ("PreToolUse", "AskUserQuestion"), ("PostToolUse", "Write|Edit|MultiEdit"))
+SELECTOR = "MEMROVE_SELECTOR=1 MEMROVE_SELECTOR_WAIT=9 "  # live subagent recall uses the Haiku selector (rec obs-6d845599)
+JIT_EVENTS = (("SubagentStart", None, True, 12), ("PreToolUse", "AskUserQuestion", False, 3), ("PostToolUse", "Write|Edit|MultiEdit", False, 3),
+              ("PreToolUse", "Bash|Agent|Monitor", True, 3))
 SKILLS = ("memrove", "memrove-doctor")
 WRAPPER_MARK = "# memrove-v3 global wrapper"
 PYTHON = sys.executable  # baked into hook commands and the wrapper; --python overrides
@@ -69,7 +71,7 @@ def is_ours(handler):
 
 def with_hooks(path, command, events, timeouts=None, jit=None):
     """settings JSON with every memrove handler replaced by `command` on `events` (None: just remove ours); `jit` is the jit command
-    wired to SubagentStart, PreToolUse(AskUserQuestion) and PostToolUse(Write|Edit|MultiEdit)."""
+    wired as JIT_EVENTS lists (the Haiku-selector ones carry the SELECTOR env prefix)."""
     data = load_json(path)
     hooks = data.setdefault("hooks", {})
     for event in list(hooks):
@@ -82,8 +84,8 @@ def with_hooks(path, command, events, timeouts=None, jit=None):
         if event == "PostToolUse":
             group["matcher"] = "Edit|Write|apply_patch"
         hooks.setdefault(event, []).append(group)
-    for event, matcher in JIT_EVENTS if command and jit else ():
-        group = {"hooks": [{"type": "command", "command": jit, "timeout": 9 if event == "SubagentStart" else 3}]}   # SubagentStart may wait up to 6 s for the Haiku selector
+    for event, matcher, selector, timeout in JIT_EVENTS if command and jit else ():
+        group = {"hooks": [{"type": "command", "command": (SELECTOR if selector else "") + jit, "timeout": timeout}]}
         if matcher:
             group["matcher"] = matcher
         hooks.setdefault(event, []).append(group)
@@ -110,7 +112,7 @@ def router(text):
 
 def plan(vault, state):
     files = {}
-    for src in sorted(SCRIPTS.glob("memrove_v3*.py")) + [SCRIPTS / n for n in ("kinds.json", "memrove_modeld.py", "memrove_v3_grab_panel.swift")]:
+    for src in sorted(SCRIPTS.glob("memrove_v3*.py")) + [SCRIPTS / n for n in ("kinds.json", "memrove_core.py", "memrove_modeld.py", "memrove_v3_grab_panel.swift")]:
         files[".claude/scripts/" + src.name] = src.read_bytes()
     files[".claude/scripts/memrove_v3_cli.py"] = (ROOT / "scripts/memrove_v3.py").read_bytes()
     files["memrove.py"] = (ROOT / "scripts/memrove_entry.py").read_bytes()

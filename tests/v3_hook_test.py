@@ -1,5 +1,6 @@
 """Hook adapter: queue, worker, synthetic-prompt filter, opt-outs and what the installer ships."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -194,6 +195,14 @@ class HookTest(unittest.TestCase):
         with patch.dict(os.environ, {"MEMROVE_NO_RECALL": "1"}):
             self.assertEqual(self.hook.recall_hook(self.state, {"prompt": "nebula"}), "{}")
         self.assertEqual(self.hook.recall_hook(self.state, {"prompt": "<task-notification> nebula"}), "{}")
+
+    def test_main_passes_the_harness_to_recall_hook(self):
+        argv = ["hook", "--vault", str(self.vault), "--state", str(self.state), "--harness", "claude", "--global"]
+        payload = json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": str(self.vault), "prompt": "nebula"})
+        with patch.object(sys, "argv", argv), patch("sys.stdin", io.StringIO(payload)), patch("builtins.print"), \
+                patch.object(self.hook, "recall_hook", return_value="{}") as rh:
+            self.hook.main()
+        self.assertEqual(rh.call_args.args[2:], ("claude",))  # production used to leave the default
 
     def test_session_start_carries_the_notice(self):
         notice = self.hook.session_notice(self.state, {"source": "clear"})

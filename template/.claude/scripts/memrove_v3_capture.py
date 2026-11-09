@@ -257,6 +257,14 @@ def run(engine, event):
     turns = sum(1 for r in recs if r.get("type") == "assistant")
     if event.get("event") == "Stop" and turns < event.get("min_turns", 40):
         return 0  # Stop is throttled; cursor stays so the next trigger sees these turns
+    import memrove_v3_access as access
+    agent, policy = access.harness_agent(event.get("harness")), access.load(engine.state)
+    if not access.can_write(policy, agent):
+        saved[sid] = {"cursor": new_cursor, "tasks": cur.get("tasks", {})}  # skip what was read, so the next trigger does not re-read it
+        tmp = state_file.with_name(state_file.name + "." + uuid.uuid4().hex + ".tmp")
+        tmp.write_text(json.dumps(dict(list(saved.items())[-200:]), ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, state_file)
+        return 0  # the policy keeps this agent's sessions out of memory
     count_used(engine, sid, recs)
     cwd, project = event.get("cwd") or ".", event.get("project") or "unknown"
     tasks, files, quotes, prev, owners, last_a = cur.get("tasks", {}), [], [], "", [], ""
@@ -278,7 +286,7 @@ def run(engine, event):
         firsts.setdefault((typ, quote), (p, ctx))
     for (typ, quote), (p, ctx) in list(firsts.items())[:MAX_NEW]:
         rid = "q-" + _sha(project + typ + quote, 16)
-        meta = dict(base, id=rid, kind=typ, key=key_of(quote), polarity="neg" if typ == "rejected" else "pos")
+        meta = dict(base, agent=agent, id=rid, kind=typ, key=key_of(quote), polarity="neg" if typ == "rejected" else "pos")
         old = opposed(engine, project, meta["key"], meta["polarity"], rid, quote)
         if old:  # a later opposite statement on the same key retires the earlier record (supersedes)
             meta["supersedes"] = old

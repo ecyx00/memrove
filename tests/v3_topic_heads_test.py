@@ -226,7 +226,13 @@ class TopicHeads(unittest.TestCase):
         self.assertEqual(install_v3.install_global(self.vault, self.state, **kw)["status"], "unchanged")
         hooks = json.loads(first)["hooks"]
         jit = [(e, g.get("matcher")) for e, gs in hooks.items() for g in gs for h in g["hooks"] if "memrove_v3_jit.py" in h["command"]]
-        self.assertEqual(sorted(jit, key=str), sorted([("SubagentStart", None), ("PreToolUse", "AskUserQuestion"), ("PostToolUse", "Write|Edit|MultiEdit")], key=str))
+        self.assertEqual(sorted(jit, key=str), sorted([("SubagentStart", None), ("PreToolUse", "AskUserQuestion"), ("PostToolUse", "Write|Edit|MultiEdit"),
+                                                       ("PreToolUse", "Bash|Agent|Monitor")], key=str))
+        sel = {(e, g.get("matcher")): g["hooks"][0] for e, gs in hooks.items() for g in gs if "memrove_v3_jit.py" in g["hooks"][0]["command"]}
+        for key, timeout in ((("SubagentStart", None), 12), (("PreToolUse", "Bash|Agent|Monitor"), 3)):  # the live Haiku selector entries
+            self.assertTrue(sel[key]["command"].startswith("MEMROVE_SELECTOR=1 MEMROVE_SELECTOR_WAIT=9 "))
+            self.assertEqual(sel[key]["timeout"], timeout)
+        self.assertFalse(sel[("PreToolUse", "AskUserQuestion")]["command"].startswith("MEMROVE"))
         self.assertEqual(len(hooks["SubagentStart"]), 2)  # the foreign entry stays
         install_v3.install_global(self.vault, self.state, uninstall=True, **kw)
         self.assertNotIn("memrove", settings.read_text())

@@ -126,7 +126,11 @@ COMMANDS = {
         opt("--since", help="only from this date on (YYYY-MM-DD or ISO datetime)"), opt("--until", help="only up to this date, inclusive"),
         opt("--history", action="store_true", help="also show entries a newer topic head replaced"),
         opt("--records", action="store_true", help="records only, all kinds, JSON"),
-        opt("--compact", action="store_true", help="with --records: one line per hit")]),
+        opt("--compact", action="store_true", help="with --records: one line per hit"),
+        opt("--json", action="store_true", help="JSON hits from Core.recall: access policy of --agent applied, chat and records merged"),
+        opt("--as-of", help="with --json: only what existed up to this day (YYYY-MM-DD)")]),
+    "reflect": ("Nightly audit: marks, merges and closes (valid_to, never deletes) what two model passes agree on; dry unless --apply (calls the model; MEMROVE_NO_LLM=1 skips it)", [
+        opt("--apply", action="store_true", help="act; without it nothing is written"), opt("--dry", action="store_true", help="the default; kept for old callers"), opt("--day", help="default: today"), opt("--until"), opt("--project")]),
     "show": ("One memory in full (id or unique prefix from a recall card)", [opt("id")]),
     "wiki": ("Concept wiki tools for the writer agent: evidence | check | publish | source fetch | research catalog", [
         opt("action", choices=("check", "research", "source", "evidence", "publish")),
@@ -180,6 +184,7 @@ def parser():
     root = argparse.ArgumentParser(prog="memrove", description=__doc__)
     root.add_argument("--vault", required=True, type=Path, help="existing vault directory")
     root.add_argument("--state", type=Path, help="local state directory outside the vault")
+    root.add_argument("--agent", help="agent name for the access policy and the record (default: env MEMROVE_AGENT, else claude-code)")
     sub = root.add_subparsers(dest="command", metavar="command", required=True)
     for name, (help_text, options) in COMMANDS.items():
         command = sub.add_parser(name, help=help_text)
@@ -203,6 +208,14 @@ class Context:
     def engine(self):
         from memrove_v3_sync import SyncEngine
         return SyncEngine(self.vault, self.state)
+
+    def core(self):
+        from memrove_core import Core
+        return Core(self.vault, self.state)
+
+
+def agent_of(args):
+    return args.agent or os.environ.get("MEMROVE_AGENT") or "claude-code"  # = memrove_core.DEFAULT_AGENT, not imported: every command would pay for Core
 
 
 def emit(result, ensure_ascii=True):
@@ -462,6 +475,13 @@ def cmd_import_chats(args, ctx):
 
 def cmd_search(args, ctx):
     ok = getattr(args, "visible", None)
+    if args.json:
+        if args.since or args.until or args.history:
+            raise ValueError("--json does not take --since, --until or --history; use --as-of DAY")
+        if not args.query.strip():
+            raise ValueError("search needs a query")
+        hits = ctx.core().recall(args.query, scope={"agent": agent_of(args)}, k=args.limit or 8, as_of=args.as_of)
+        return emit([h for h in hits if not ok or h["arm"] != "record" or ok(str(h["id"]))], ensure_ascii=False)
     if args.records:
         from memrove_v3_recall import search
         n = args.limit or 10
@@ -477,6 +497,13 @@ def cmd_search(args, ctx):
     out = chat_search.search(ctx.state, args.query, *([args.limit] if args.limit else []), since=args.since, until=args.until, history=args.history)
     print(_reader_lines(out, ok) if ok else out)
     return 0
+
+
+def cmd_reflect(args, ctx):
+    if args.apply and args.dry:
+        raise SystemExit("reflect: --apply and --dry exclude each other")
+    scope = {"agent": agent_of(args), **({"project": args.project} if args.project else {})}
+    return emit(ctx.core().reflect(scope=scope, kind="dream", day=args.day, until=args.until, dry=not args.apply), ensure_ascii=False)
 
 
 MESSAGE_LINE = re.compile(r"^(\d+|x-[0-9a-f]+)\|")
@@ -517,15 +544,19 @@ def cmd_show(args, ctx):
 
 
 def cmd_remember(args, ctx):
-    from memrove_v3_context import remember
     cwd = Path(args.cwd).expanduser().resolve()
     project = args.project or project_name(cwd, ctx.state)
     trigger = None
     if args.trigger or args.trigger_tool:  # validate before anything is saved
         import memrove_v3_triggers
         trigger = memrove_v3_triggers.spec(args.trigger_tool, args.trigger, args.trigger_cwd, args.trigger_deny)
-    result = remember(ctx.engine(), args.kind, args.text, args.why, project, args.user,
-                      args.session or current_session(cwd), supersedes=args.supersedes, topic=args.topic, check=args.check, measured=args.scope)
+    item = {"kind": args.kind, "text": args.text, "why": args.why, "project": project, "user": args.user, "source": "memrove-cli",
+            "supersedes": args.supersedes, "topic": args.topic, "check": args.check, "measured": args.scope}
+    result = ctx.core().ingest(item, scope={"agent": agent_of(args), "session": args.session or current_session(cwd)})[0]   # evidence mark, access check and relate run inside
+    if result["status"] == "denied":
+        raise PermissionError("access.json does not let this agent write; pass --agent or set MEMROVE_AGENT")
+    if result["status"] == "forgotten":
+        raise ValueError("this text was forgotten by the owner; not saved")
     if result["status"] == "exists":
         print(result["id"] + " (exists)", file=sys.stderr)
     print(result["id"])
@@ -547,6 +578,8 @@ def cmd_remember(args, ctx):
                 print(line, file=sys.stderr)
         except Exception:  # the nudge is a courtesy; the record is already saved
             pass
+    for p in result.get("proposals") or []:  # relate_new (MEMROVE_RELATE=1): older records this one may replace
+        print(f"relate proposal: {p['src']} may replace {p['dst']}: {p['why']}", file=sys.stderr)
     if args.kind in ("decision", "rejected"):
         try:
             from memrove_v3_nudge import topic_line
@@ -639,7 +672,7 @@ HANDLERS = {"init": cmd_init, "sync": cmd_sync, "wake": cmd_chat, "zoom": cmd_ch
             "rebrief": cmd_rebrief, "doc": cmd_doc, "grab": cmd_grab, "project": cmd_project, "graph": cmd_graph,
             "wiki": cmd_wiki, "backup": cmd_backup, "restore": cmd_restore, "preferences": cmd_preferences,
             "recall-stats": cmd_recall_stats, "doctor": cmd_doctor, "companion-compact": cmd_compact,
-            "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "show": cmd_show,
+            "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "reflect": cmd_reflect, "show": cmd_show,
             "remember": cmd_remember, "rules": cmd_rules, "rule-scope": cmd_rule_scope, "trigger": cmd_trigger, "card": cmd_card, "pack": cmd_pack}
 
 

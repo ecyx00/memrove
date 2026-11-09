@@ -131,7 +131,8 @@ class Core:
                     continue
             out.append(remember(self.sync, it.get("kind", "note"), it["text"], why=it.get("why"), project=it.get("project") or scope.get("project"),
                                 session=scope.get("session"), source=it.get("source", "memrove-core"), topic=it.get("topic"),
-                                valid_from=it.get("valid_from"), agent=scope.get("agent") or DEFAULT_AGENT, user=bool(it.get("user"))))
+                                valid_from=it.get("valid_from"), agent=scope.get("agent") or DEFAULT_AGENT, user=bool(it.get("user")),
+                                supersedes=it.get("supersedes") or (), check=it.get("check"), measured=it.get("measured")))
             if out[-1].get("id"):
                 try:
                     evidence.mark(self, out[-1]["id"])  # shortcut: loads the whole chat log per call, pass a cached log= if ingest gets hot

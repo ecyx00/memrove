@@ -14,7 +14,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 # The Python files the installer ships.
 PACKAGED = sorted([ROOT / 'scripts' / name for name in ('install_v3.py', 'memrove_v3.py', 'memrove_entry.py')]
-                  + list((ROOT / 'template/.claude/scripts').glob('memrove_v3*.py')))
+                  + list((ROOT / 'template/.claude/scripts').glob('memrove_v3*.py')) + [ROOT / 'template/.claude/scripts/memrove_core.py'])
 # Shipped too, but run by its own venv (mlx), never imported by the stdlib runtime: outside the import guard.
 MODEL_DAEMON = [ROOT / 'template/.claude/scripts/memrove_modeld.py']
 

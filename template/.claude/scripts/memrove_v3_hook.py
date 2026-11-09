@@ -332,7 +332,7 @@ def run_worker(vault, state):
     return outcome
 
 
-def recall_hook(state, payload):
+def recall_hook(state, payload, harness="claude"):
     """UserPromptSubmit recall cards: typed records, then the chat-log lane (pointer lines). Read-only for records; the lane only
     writes its seen-ids file. Independent of the queue; any error leaves a trace and returns '{}'."""
     try:
@@ -340,6 +340,10 @@ def recall_hook(state, payload):
             return "{}"
         from memrove_v3_push import read as push_read
         if not push_read(state)["recall_cards"]:
+            return "{}"
+        import memrove_v3_access as access
+        policy = access.load(state)  # no access.json: open, as before
+        if policy is not None and not access.can_read(policy, access.harness_agent(harness), project_root(Path(payload.get("cwd") or "."), state).name):
             return "{}"
         text = ""
         if (Path(state) / "memory.sqlite3").is_file():
@@ -497,7 +501,7 @@ def main():
             print("{}")
             return
         if event == "UserPromptSubmit" and args.global_mode and args.harness == "claude" and not args.metadata_only:
-            out, line = recall_hook(state, payload), pastref_line(payload, state)
+            out, line = recall_hook(state, payload, args.harness), pastref_line(payload, state)
             if line:
                 cards = json.loads(out).get("hookSpecificOutput", {}).get("additionalContext", "")
                 out = json.dumps(output_context(event, (cards + "\n" if cards else "") + line))

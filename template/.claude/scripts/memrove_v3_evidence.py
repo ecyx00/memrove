@@ -72,9 +72,20 @@ def quotes(r):
 
 def verify(state, record, log=None):
     """-> evidence list [{"kind": "msg", "ref": k}] for a record whose quote is verbatim in the chat log, else []."""
-    log = log or load(state)
+    qs = quotes(record)
     refs = []
-    for q, user_only in quotes(record):
+    if log is None and qs:  # one record: scan the messages, norm() only those holding a quote's longest word (indexing 13k messages costs ~70 ms)
+        anchors = [(q, u, max(q.split(), key=len)) for q, u in qs]
+        for m in (m for f in chatlog._files(chatlog.root(state)) for m in chatlog.read_file(f)):
+            low = str(m["text"]).casefold()
+            if not m.get("k") or not any(w in low for _, _, w in anchors):
+                continue
+            n = norm(m["text"])
+            for q, user_only, _ in anchors:
+                if q in n and (m.get("kind") == "user" or not user_only) and m["k"] not in refs:
+                    refs.append(m["k"])
+        return [{"kind": "msg", "ref": k} for k in refs[:REFS]]
+    for q, user_only in qs:
         for k in Log.find(log.user if user_only else log.all, q):
             if k not in refs:
                 refs.append(k)
