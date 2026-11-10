@@ -160,7 +160,7 @@ def _retry_locked(sync, fn, budget=120.0):
             pass
 
 
-def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None, valid_from=None, agent=None):
+def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None, valid_from=None, agent=None, close=True):
     """Model-written memory: same observe contract (validate, commit, readback), core kinds allowed. Idempotent on (kind, text)."""
     from memrove_v3_capture import has_secret, key_of
     if kind not in REMEMBER_KINDS:
@@ -214,6 +214,15 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
     if supersedes:
         from memrove_v3_checks import forget
         forget(sync.state, payload["supersedes"])
+        from memrove_v3_projections import update_record  # close the old record's window, same path as capture's supersede
+        today = datetime.now(timezone.utc).date().isoformat()
+        for old in payload["supersedes"] if close else ():  # Core.update passes close=False: it closes the old record itself, front matter too
+            if old == result["id"]:  # identical text came back as "exists" with the old id: never close a record on itself
+                continue
+            with sync.store._connect() as db:
+                row = db.execute("SELECT payload FROM records WHERE id=?", (old,)).fetchone()
+            had = json.loads(row[0]).get("superseded_by") or [] if row else []
+            update_record(sync, old, {"valid_to": today, "superseded_by": list(dict.fromkeys([*had, result["id"]]))})
     try:
         if result.get("status") != "exists":
             import memrove_v3_decide_log as dl

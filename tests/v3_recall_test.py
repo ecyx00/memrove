@@ -118,6 +118,13 @@ class RecallTest(Base):
         self.add('l1', **dict(LESSON, project='here'))
         self.assertEqual(self.recall(), '')
 
+    def test_exposure_logs_bare_record_ids(self):
+        self.add('l1', **LESSON)
+        self.assertNotEqual(self.recall(), '')
+        with self.store._connect() as db:
+            ids = [r[0] for r in db.execute("SELECT item_id FROM exposure WHERE path='recall'")]
+        self.assertTrue(ids and not [i for i in ids if i.startswith('recall:')], ids)
+
     def test_not_injected_twice_in_session(self):
         self.add('l1', **LESSON)
         self.assertNotEqual(self.recall(), '')

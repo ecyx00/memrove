@@ -385,6 +385,11 @@ def recall(store, prompt, cwd, session, transcript=None):
     if not store.read_only:
         with store._connect() as db:
             db.executemany("INSERT OR IGNORE INTO injected VALUES(?,?,?)", [(session, epoch, b) for b in blocks])
+    try:
+        import memrove_v3_exposure as ex
+        ex.log(store.state_dir, "recall", passed, "prompt", session)
+    except Exception:
+        pass
     header = "Related memories (summary text; `memrove show <id>` for detail):" if hybrid else "Possibly related memories; open with `memrove show <id>` if needed:"
     return ENVELOPE.format("\n".join([header] + lines))
 

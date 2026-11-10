@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 STATE_INLINE_MAX = 2000
-TAIL_BYTES = 4_000_000  # lookups read only the newest part of the log
 SECRETS = re.compile(
     r"sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}"
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z_\-]{30,}|Bearer\s+[A-Za-z0-9._\-]{16,}"
@@ -79,18 +78,21 @@ def set_outcome(decision_id, outcome):
         pass
 
 
-def _tail(use):
-    """Decisions of one `use` from the newest part of the log, outcomes merged in. -> list of dicts (oldest first)."""
-    p = path()
+def _tail(use, limit=None):
+    """Decisions of one `use` from the whole log (or its last `limit` bytes), outcomes merged in. -> list of dicts (oldest first).
+    Every line of that use (decision or outcome) carries `"id": "<use>-` and is the only one parsed, so an 18 MB log costs a byte scan, not 20k json.loads."""
+    needle = b'"id": "' + use.encode() + b"-"
     by, order = {}, []
-    with p.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        f.seek(max(0, size - TAIL_BYTES))
-        data = f.read().decode("utf-8", "replace")
-    for line in data.splitlines():
+    with path().open("rb") as f:
+        if limit:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - limit))  # a cut first line fails json.loads and is skipped
+        data = f.read()
+    for raw in data.split(b"\n"):
+        if needle not in raw:
+            continue
         try:
-            r = json.loads(line)
+            r = json.loads(raw)
         except ValueError:
             continue
         if "use" in r:
@@ -127,7 +129,7 @@ def log_capture_kind(text, kind, record_id, stage, source="model", confidence=No
 def kind_corrected(text, record_id, new_kind, by):
     """Mark earlier capture_kind labels of this record (or this exact text) that said something else as corrected."""
     try:
-        for r in _tail("memrove.capture_kind"):
+        for r in _tail("memrove.capture_kind", limit=4 << 20):
             if (_state(r).get("record") == record_id or r.get("question") == text) and r.get("answer") != new_kind \
                     and (r.get("outcome") or {}).get("corrected_to") != new_kind:
                 set_outcome(r["id"], {"corrected_to": new_kind, "by": by})

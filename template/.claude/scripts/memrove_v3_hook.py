@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -102,6 +103,15 @@ def output_context(event, text):
 
 def session_key(payload):
     return hashlib.sha256(str(payload.get("session_id", "unknown")).encode()).hexdigest()[:24]
+
+
+def expose(state, payload, path, ids, slot):
+    """Exposure log: ids a give path just showed. Never raises."""
+    try:
+        import memrove_v3_exposure as ex
+        ex.log(state, path, ids, slot, ex.key(payload.get("session_id")))
+    except Exception:
+        pass
 
 
 def pastref_line(payload, state=None):
@@ -514,13 +524,17 @@ def main():
                     try:  # standing rules are pushed text (a rule works by being in context)
                         from memrove_v3_rules import block as rules_block
                         from memrove_v3_project import project_name
-                        notice += rules_block(state, project_name(payload.get("cwd"), state, vault), cwd=payload.get("cwd"))
+                        shown = []
+                        notice += rules_block(state, project_name(payload.get("cwd"), state, vault), cwd=payload.get("cwd"), ids=shown)
+                        expose(state, payload, "rules", shown, "rules")
                     except Exception:
                         pass
                     try:  # the handoff card of the project's last session
                         from memrove_v3_card import block as card_block
                         from memrove_v3_project import project_name
-                        notice += card_block(state, project_name(payload.get("cwd"), state, vault))
+                        text = card_block(state, project_name(payload.get("cwd"), state, vault))
+                        notice += text
+                        expose(state, payload, "card", re.findall(r"handoff card (\S+):\n", text), "card")
                         from memrove_v3_card import PROTOCOL
                         notice += PROTOCOL
                     except Exception:

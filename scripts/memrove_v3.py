@@ -47,6 +47,20 @@ def current_session(cwd: Path):
     return newest.stem if newest else None
 
 
+def _expose(state, path, ids, slot):
+    """Exposure log of a give command (ids and a query hash only); a log problem never costs the command."""
+    try:
+        import memrove_v3_exposure as ex
+        ex.log(state, path, ids, slot, ex.env_session())
+    except Exception:
+        pass
+
+
+def qhash_of(query):
+    import memrove_v3_exposure as ex
+    return ex.qhash(query)
+
+
 # --- parser ---------------------------------------------------------------------------------------
 
 def opt(*flags, **kw):
@@ -115,6 +129,9 @@ COMMANDS = {
         opt("--real-use", action="store_true", help="instead: do the injected memory lines fire in the live transcripts, and get followed?"),
         opt("--backfill", action="store_true", help="first run the detector over transcripts into a temp copy of the decision log"),
         opt("--backfill-live", action="store_true", help="like --backfill but append the outcomes to the live decision log")]),
+    "incidents-backfill": ("Owner-correction detector over the chat log of the last N days; read-only on the state, writes incidents.sqlite3 and positives.txt to --out", [
+        opt("--out", required=True, type=Path), opt("--days", type=int, default=60), opt("--workers", type=int, default=6),
+        opt("--positives", type=int, default=50, help="how many random correction-of-memory owner message ids to list")]),
     "preferences": ("Control the automatic background sync, the secret filter and recall cards", [
         opt("--profile", choices=("normal", "economical", "manual")), opt("--auto-sync", **ON_OFF),
         opt("--interval-minutes", type=int), opt("--secret-filter", **ON_OFF),
@@ -242,6 +259,7 @@ def cmd_chat(args, ctx):
         print(tree.wake_all(state) if args.all else tree.wake(state, args.part))
     elif command == "zoom":
         print(tree.zoom(state, args.id, args.n, args.page))
+        _expose(state, "zoom", [str(args.id)], f"n={args.n}")
     elif command == "date":
         print(tree.date_of(state, args.id))
     elif args.action == "run":
@@ -265,6 +283,11 @@ def cmd_chat(args, ctx):
     else:
         print(json.dumps(tree.replay_stability(state, args.last), indent=2))
     return 0
+
+
+def cmd_incidents_backfill(args, ctx):
+    import memrove_v3_incidents as inc
+    return emit(inc.backfill(ctx.state, ctx.vault, args.out, args.days, args.workers, args.positives))
 
 
 def cmd_rebrief(args, ctx):
@@ -486,6 +509,7 @@ def cmd_search(args, ctx):
         from memrove_v3_recall import search
         n = args.limit or 10
         hits = [h for h in search(ctx.store(), args.query, n * 5 if ok else n) if not ok or ok(str(h.get("id", "")))][:n]   # filtered after a wider pull, so a restricted reader still gets up to n
+        _expose(ctx.state, "search", [str(h.get("id")) for h in hits], qhash_of(args.query))
         if not args.compact:
             return emit(hits)
         for hit in hits:
@@ -496,6 +520,7 @@ def cmd_search(args, ctx):
     import memrove_v3_chatsearch as chat_search
     out = chat_search.search(ctx.state, args.query, *([args.limit] if args.limit else []), since=args.since, until=args.until, history=args.history)
     print(_reader_lines(out, ok) if ok else out)
+    _expose(ctx.state, "search", [m.group(1) for ln in out.splitlines() if (m := re.match(r"^(\d+|x-[0-9a-f]+|rec:[^|]+)\|", ln))], qhash_of(args.query))
     return 0
 
 
@@ -535,6 +560,7 @@ def cmd_show(args, ctx):
     if ok and not ok(args.id):
         raise PermissionError(f"record {args.id} is not shown to this reader (egress label); the owner can set MEMROVE_READER=local for a harness that may see every record")
     out = show(ctx.store(), args.id.removeprefix("rec:"))
+    _expose(ctx.state, "show", [str(out.get("id") if isinstance(out, dict) else args.id)], None)
     if isinstance(out, dict) and out.get("kind") != "thread":
         import memrove_v3_neighbours as neighbours
         edges = [e for e in neighbours.edges_of(ctx.state, out.get("id", "")) if not ok or ok(str(e.get("id", "")))]   # a neighbour's summary is record text too
@@ -669,7 +695,7 @@ def cmd_pack(args, ctx):
 
 
 HANDLERS = {"init": cmd_init, "sync": cmd_sync, "wake": cmd_chat, "zoom": cmd_chat, "date": cmd_chat, "chatlog": cmd_chat,
-            "rebrief": cmd_rebrief, "doc": cmd_doc, "grab": cmd_grab, "project": cmd_project, "graph": cmd_graph,
+            "rebrief": cmd_rebrief, "incidents-backfill": cmd_incidents_backfill, "doc": cmd_doc, "grab": cmd_grab, "project": cmd_project, "graph": cmd_graph,
             "wiki": cmd_wiki, "backup": cmd_backup, "restore": cmd_restore, "preferences": cmd_preferences,
             "recall-stats": cmd_recall_stats, "doctor": cmd_doctor, "companion-compact": cmd_compact,
             "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "reflect": cmd_reflect, "show": cmd_show,

@@ -211,7 +211,7 @@ def from_picks(state, picks):
     return sorted(out, key=_group)[:MAX_ITEMS]
 
 
-def block(state, brief, project=None, picks=None):
+def block(state, brief, project=None, picks=None, ids=None):
     """The injected text ('' when nothing relevant), within BUDGET_CHARS. picks: the Haiku selector's ids; they replace the dense/bm25 result."""
     items = from_picks(state, picks) if picks else recall(state, brief, project)
     q = query_of(brief)
@@ -219,6 +219,8 @@ def block(state, brief, project=None, picks=None):
         conf = _conflicts(items)
         text = HEAD + "\n".join(_line(c, q, conf.get(c["id"])) for c in items)
         if len(text) <= BUDGET_CHARS:
+            if ids is not None:  # the caller's exposure log
+                ids.extend(c["id"] for c in items)
             return text
         items = items[:-1]
     return ""

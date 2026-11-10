@@ -160,7 +160,7 @@ def _neg(when):
     return [-ord(c) for c in when]
 
 
-def block(state, project=None, global_only=False, cap=None, cwd=None):
+def block(state, project=None, global_only=False, cap=None, cwd=None, ids=None):
     """The block text ('' when off, empty or on any error). Whole sentences only; when the cap cuts, the last line counts the rest and names the command that lists them."""
     if os.environ.get("MEMROVE_RULES") == "0":
         return ""
@@ -177,6 +177,8 @@ def block(state, project=None, global_only=False, cap=None, cwd=None):
         k -= 1
     if not k:
         return ""
+    if ids is not None:  # the caller's exposure log: which rule ids went out
+        ids.extend(i for *_, i in items[:k])
     return HEAD + "".join(lines[:k]) + (notice(len(lines) - k) if k < len(lines) else "")
 
 
@@ -186,7 +188,7 @@ def left_out(state, project=None, cwd=None):
     return [(i, tag, rule) for _, tag, rule, i in rules(state, project, cwd=cwd)[shown:]]
 
 
-def short_block(state, n=8):
+def short_block(state, n=8, ids=None):
     """The subagent form of the standing rules: the n most-repeated/newest global rules only (project rules reach an agent through recall). '' when off or on any error."""
     if os.environ.get("MEMROVE_RULES") == "0":
         return ""
@@ -194,4 +196,6 @@ def short_block(state, n=8):
         items = rules(state, None, global_only=True)[:n]
     except Exception:
         return ""
+    if ids is not None:
+        ids.extend(i for *_, i in items)
     return HEAD + "".join("- " + rule + "\n" for _, _, rule, _ in items) if items else ""

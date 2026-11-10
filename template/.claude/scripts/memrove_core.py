@@ -159,7 +159,7 @@ class Core:
         start = new.get("valid_from") or _today()
         res = remember(self.sync, new.get("kind", old.get("kind", "note")), new["text"], why=new.get("why"), project=new.get("project") or old.get("project"),
                        source=new.get("source", "memrove-core"), topic=new.get("topic") or old.get("topic"), valid_from=start,
-                       agent=new.get("agent") or old.get("agent") or DEFAULT_AGENT, supersedes=[oid] if supersedes else ())
+                       agent=new.get("agent") or old.get("agent") or DEFAULT_AGENT, supersedes=[oid] if supersedes else (), close=False)
         closes = supersedes and not old.get("valid_to") and res["id"] != oid and res.get("status") != "exists"  # same text = same record: never close what was just written
         if closes:
             self._patch(oid, "close", valid_to=start)

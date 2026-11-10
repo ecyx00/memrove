@@ -820,6 +820,7 @@ def run_jobs(engine, vault, state, events, root=None):
     try:
         for name, fn in (("j2", lambda: session_notes(engine, vault, state, events, root)),
                          ("card", lambda: __import__("memrove_v3_card").draft_all(engine, vault, state, events, root)),  # handoff card, only for sessions with a decision cue
+                         ("incidents", lambda: __import__("memrove_v3_incidents").session_incidents(engine, vault, state, events, root)),  # owner-correction detector, one Haiku call per batch of turns
                          ("j1", lambda: judge_quotes(engine, vault, state, root)),
                          ("restate", lambda: __import__("memrove_v3_restate").restate_rules(engine, vault, state, root)),  # one English sentence + scope per owner rule, for the pushed block
                          ("lessons", lambda: judge_lessons(engine, vault, state, root)),

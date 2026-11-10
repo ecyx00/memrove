@@ -30,6 +30,15 @@ def _context(event, text):
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
 
 
+def _expose(state, payload, path, ids, slot):
+    """Exposure log row per shown id; never raises."""
+    try:
+        import memrove_v3_exposure as ex
+        ex.log(state, path, ids, slot, ex.key(payload.get("session_id")))
+    except Exception:
+        pass
+
+
 def _rules(payload):
     """The global and session-project standing rules (short cap) for a subagent; '' when off or on any error. State: MEMROVE_STATE, else the newest memrove-v3 store."""
     try:
@@ -42,7 +51,12 @@ def _rules(payload):
             found = sorted(base.glob("*/memory.sqlite3"), key=lambda p: p.stat().st_mtime)
             state = found[-1].parent if found else None
         from memrove_v3_project import project_name
-        return ("\n" + block(state, project_name(payload.get("cwd"), state))) if state else ""   # no CLAUDE.md filter: a subagent may not load the files the session loaded
+        if not state:
+            return ""
+        shown = []
+        text = block(state, project_name(payload.get("cwd"), state), ids=shown)
+        _expose(state, payload, "jit", shown, "rules")
+        return "\n" + text   # no CLAUDE.md filter: a subagent may not load the files the session loaded
     except Exception:
         return ""
 
@@ -74,8 +88,11 @@ def _recalled(payload, state):
                 picks = sel.wait(state, brief, SELECTOR_SECONDS)
                 if picks is None and payload.get("agent_id"):   # not ready: the picks go out on the agent's first tool call
                     (Path(state) / "selector" / f"late-{payload['agent_id']}").write_text(sel.key_of(brief))
-            found = sr.block(state, brief, project_name(payload.get("cwd"), state), picks) if brief else ""
-            rules = short_block(state)
+            shown, rule_ids = [], []
+            found = sr.block(state, brief, project_name(payload.get("cwd"), state), picks, ids=shown) if brief else ""
+            rules = short_block(state, ids=rule_ids)
+            _expose(state, payload, "jit", shown, "recall")
+            _expose(state, payload, "jit", rule_ids, "rules")
         finally:
             signal.alarm(0)
         if os.environ.get("MEMROVE_RECALL_DEBUG"):
@@ -140,7 +157,9 @@ def _late(payload, state):
             return None
         marker.unlink()
         picks = json.loads(res.read_text(encoding="utf-8")).get("picks")
-        text = sr.block(state, "", None, picks) if picks else ""
+        shown = []
+        text = sr.block(state, "", None, picks, ids=shown) if picks else ""
+        _expose(state, payload, "jit", shown, "late")
         return _context("PreToolUse", text.replace("Memory for this task", "More memory for this task", 1)) if text else None
     except Exception:
         return None
