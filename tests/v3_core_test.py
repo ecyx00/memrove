@@ -46,7 +46,7 @@ class CoreTest(unittest.TestCase):
         one = db.execute("SELECT * FROM graph_edges").fetchall()
         graph.migrate(db)
         self.assertEqual(one, db.execute("SELECT * FROM graph_edges").fetchall())
-        self.assertEqual(one[0][6:], ("2026-01-02", None, "2026-01-02"))  # valid_from, valid_to, recorded_at... column order below
+        self.assertEqual(one[0][6:], ("2026-01-02", None, "2026-01-02", "candidate"))  # valid_from, valid_to, recorded_at, status (old edges are candidates)
         db.close()
 
     def test_ingest_survives_evidence_mark_failure(self):
@@ -128,6 +128,15 @@ class CoreTest(unittest.TestCase):
             db.execute("UPDATE graph_edges SET valid_to='2026-03-01'")
             graph.add_edge(db, "a", "b", "relates", "again", prov)
             self.assertEqual(db.execute("SELECT valid_to, why FROM graph_edges").fetchall(), [("2026-03-01", "again")])
+
+    def test_edge_refresh_keeps_status(self):
+        prov = graph.provenance("user", "user")
+        with self.c.store._connect() as db:
+            graph.add_edge(db, "a", "b", "relates", "w", prov)
+            self.assertEqual(db.execute("SELECT status FROM graph_edges").fetchone()[0], "candidate")
+            db.execute("UPDATE graph_edges SET status='verified'")
+            graph.add_edge(db, "a", "b", "relates", "again", prov)
+            self.assertEqual(db.execute("SELECT status FROM graph_edges").fetchone()[0], "verified")
 
     def test_hard_forget_fails_closed_when_forgotten_json_fails(self):
         rid = self.c.ingest({"kind": "lesson", "text": "keep me until the list is written", "why": "w"})[0]["id"]

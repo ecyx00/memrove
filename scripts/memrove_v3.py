@@ -149,6 +149,12 @@ COMMANDS = {
     "reflect": ("Nightly audit: marks, merges and closes (valid_to, never deletes) what two model passes agree on; dry unless --apply (calls the model; MEMROVE_NO_LLM=1 skips it)", [
         opt("--apply", action="store_true", help="act; without it nothing is written"), opt("--dry", action="store_true", help="the default; kept for old callers"), opt("--day", help="default: today"), opt("--until"), opt("--project")]),
     "show": ("One memory in full (id or unique prefix from a recall card)", [opt("id")]),
+    "bridge": ("Join records to the chat log (source_msg_id, edge status, dangling concepts); dry unless --apply (the Haiku step calls the model)", [
+        opt("--apply", action="store_true", help="write; without it nothing in the store changes"), opt("--dry", action="store_true", help="the default; kept for symmetry"),
+        opt("--no-llm", action="store_true", help="code stages only"), opt("--max-calls", type=int, help="Haiku call budget (default 40; with --provenance: unlimited)"), opt("--cache", help="JSON file that keeps Haiku picks between runs"),
+        opt("--provenance", action="store_true", help="content + authority pointers per p/obs/l/q record (needs the model; --apply writes them, --no-llm is ignored)"),
+        opt("--chat-state", type=Path, help="with --provenance: state dir holding the chat log (default: --state)"),
+        opt("--out", help="write the per-record result (ids and counts only) to this JSON file")]),
     "wiki": ("Concept wiki tools for the writer agent: evidence | check | publish | source fetch | research catalog", [
         opt("action", choices=("check", "research", "source", "evidence", "publish")),
         opt("page", nargs="?", help="check/publish: the page file; research: catalog; source: fetch"),
@@ -173,6 +179,8 @@ COMMANDS = {
         opt("--user", action="store_true", help="the text quotes the user verbatim (origin user_explicit)"),
         opt("--session", help="default: CLAUDE_CODE_SESSION_ID, else the newest transcript of --cwd"),
         opt("--supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; repeatable"),
+        opt("--from", dest="from_msg", type=int, help="chat-log message id the idea came from; needs --span"),
+        opt("--span", help="5+ words copied verbatim from that message; checked by code, a fake one refuses the save"),
         opt("--check", help="read-only shell line that exits 0 while the record is true (allowlisted, 5 s); dry-run now, refused if it fails"),
         opt("--scope", help="where it was measured: repo, workload, n"),
         opt("--topic", help="slug of the topic this decision belongs to; the newest entry per topic is its head (the nudge lists existing slugs)"),
@@ -513,7 +521,7 @@ def cmd_search(args, ctx):
         if not args.compact:
             return emit(hits)
         for hit in hits:
-            print(f"#{hit['id']} {hit['line'].replace('[other project: ', '[', 1)}")
+            print(f"#{hit['id']} {hit['line'].replace('[other project: ', '[', 1)}" + (f" [msg {hit['source_msg_id']}]" if hit.get("source_msg_id") is not None else ""))
         return 0
     if not args.query.strip() and not (args.since or args.until):
         raise ValueError("search needs a query or --since / --until")
@@ -554,6 +562,15 @@ def _record_check(state, tier):
     return ok
 
 
+def cmd_bridge(args, ctx):
+    if args.apply and args.dry:
+        raise SystemExit("bridge: --apply and --dry exclude each other")
+    import memrove_v3_msgbridge as bridge
+    if args.provenance:
+        return emit(bridge.run_provenance(ctx, apply=args.apply, max_calls=args.max_calls, out=args.out, chat_state=args.chat_state, cache_file=args.cache), ensure_ascii=False)
+    return emit(bridge.run(ctx, apply=args.apply, llm=not args.no_llm, max_calls=40 if args.max_calls is None else args.max_calls, cache_file=args.cache, out=args.out), ensure_ascii=False)
+
+
 def cmd_show(args, ctx):
     from memrove_v3_recall import show
     ok = getattr(args, "visible", None)
@@ -578,7 +595,10 @@ def cmd_remember(args, ctx):
         trigger = memrove_v3_triggers.spec(args.trigger_tool, args.trigger, args.trigger_cwd, args.trigger_deny)
     item = {"kind": args.kind, "text": args.text, "why": args.why, "project": project, "user": args.user, "source": "memrove-cli",
             "supersedes": args.supersedes, "topic": args.topic, "check": args.check, "measured": args.scope}
-    result = ctx.core().ingest(item, scope={"agent": agent_of(args), "session": args.session or current_session(cwd)})[0]   # evidence mark, access check and relate run inside
+    sess = args.session or current_session(cwd)
+    import memrove_v3_prov as prov
+    item["provenance"] = prov.remember_fields(ctx.state, sess, args.from_msg, args.span)  # raises on a fake --from/--span: nothing is saved
+    result = ctx.core().ingest(item, scope={"agent": agent_of(args), "session": sess})[0]   # evidence mark, access check and relate run inside
     if result["status"] == "denied":
         raise PermissionError("access.json does not let this agent write; pass --agent or set MEMROVE_AGENT")
     if result["status"] == "forgotten":
@@ -698,7 +718,7 @@ HANDLERS = {"init": cmd_init, "sync": cmd_sync, "wake": cmd_chat, "zoom": cmd_ch
             "rebrief": cmd_rebrief, "incidents-backfill": cmd_incidents_backfill, "doc": cmd_doc, "grab": cmd_grab, "project": cmd_project, "graph": cmd_graph,
             "wiki": cmd_wiki, "backup": cmd_backup, "restore": cmd_restore, "preferences": cmd_preferences,
             "recall-stats": cmd_recall_stats, "doctor": cmd_doctor, "companion-compact": cmd_compact,
-            "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "reflect": cmd_reflect, "show": cmd_show,
+            "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "reflect": cmd_reflect, "show": cmd_show, "bridge": cmd_bridge,
             "remember": cmd_remember, "rules": cmd_rules, "rule-scope": cmd_rule_scope, "trigger": cmd_trigger, "card": cmd_card, "pack": cmd_pack}
 
 

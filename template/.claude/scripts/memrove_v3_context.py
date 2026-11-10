@@ -160,7 +160,7 @@ def _retry_locked(sync, fn, budget=120.0):
             pass
 
 
-def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None, valid_from=None, agent=None, close=True):
+def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None, valid_from=None, agent=None, close=True, provenance=None):
     """Model-written memory: same observe contract (validate, commit, readback), core kinds allowed. Idempotent on (kind, text)."""
     from memrove_v3_capture import has_secret, key_of
     if kind not in REMEMBER_KINDS:
@@ -194,6 +194,8 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
         payload["check"] = check.strip()
     if measured:
         payload["measured"] = " ".join(measured.split())
+    if provenance:  # pointers code already verified (memrove_v3_prov.remember_fields)
+        payload.update(provenance)
     if topic:  # the writer's key: the newest decision/rejected per (project, topic) is the head (memrove_v3_heads)
         from memrove_v3_heads import slug
         if slug(topic):

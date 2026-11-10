@@ -136,6 +136,8 @@ def migrate(db):
     for col in ('valid_from', 'valid_to', 'recorded_at'):
         if col not in have:
             db.execute(f'ALTER TABLE graph_edges ADD COLUMN {col} TEXT')
+    if 'status' not in have:  # verified | candidate; only code that checked the edge against the chat log writes `verified` (memrove_v3_msgbridge)
+        db.execute("ALTER TABLE graph_edges ADD COLUMN status TEXT NOT NULL DEFAULT 'candidate'")
     db.execute('UPDATE graph_edges SET valid_from=ts WHERE valid_from IS NULL')
     db.execute('UPDATE graph_edges SET recorded_at=ts WHERE recorded_at IS NULL')
     db.execute('CREATE INDEX IF NOT EXISTS ge_src_type_from ON graph_edges(src, type, valid_from)')
@@ -168,7 +170,7 @@ def add_edge(db, src, dst, type, why, prov):
         raise ValueError('an edge needs a why (one sentence)')
     if src == dst:
         raise ValueError('an edge needs two different nodes')
-    # upsert keeps valid_from/valid_to/recorded_at: a refresh never reopens a closed edge or moves its interval
+    # upsert keeps valid_from/valid_to/recorded_at/status (verification depends on the ends, not the why): a refresh never reopens a closed edge or moves its interval
     db.execute('INSERT INTO graph_edges(src,dst,type,why,prov,ts,valid_from,recorded_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(src,dst,type) DO UPDATE SET why=excluded.why, prov=excluded.prov, ts=excluded.ts', (src, dst, type, why, json.dumps(prov, ensure_ascii=False, sort_keys=True), prov['at'], prov['at'], prov['at']))
 
 

@@ -400,7 +400,8 @@ def search(store, query, limit=10):
     for s in _rank(_load(store), terms(query), gate=False)[:limit]:
         r = s["r"]
         out.append({"id": r["id"], "kind": r.get("kind"), "project": r.get("project"), "updated_at": r.get("updated_at"),
-                    "origin": "you" if s["user"] else "inferred", "score": round(s["score"], 4), "line": _line(s, 300)})
+                    "origin": "you" if s["user"] else "inferred", "score": round(s["score"], 4), "line": _line(s, 300),
+                    **({"source_msg_id": r["source_msg_id"]} if r.get("source_msg_id") is not None else {})})
     return out
 
 
@@ -425,8 +426,8 @@ def show(store, rid):
         raise ValueError(f"no unique record for {rid!r}")
     r = json.loads(rows[0][0])
     keys = ("id", "kind", "project", "title", "text", "approach", "result", "situation", "why", "measured", "check", "reuse", "evidence", "quote", "verified_by",
-            "origin_type", "session", "updated_at", "valid_from", "created_at", "status")
-    out = {k: r[k] for k in keys if r.get(k) not in (None, "", [], {})}
+            "origin_type", "session", "updated_at", "valid_from", "created_at", "status", "source_msg_id", "source_quote_span")
+    out = {k: r[k] for k in keys if r.get(k) not in (None, "", [], {})}   # source_msg_id: `memrove zoom <id> 1` opens the owner's message
     with store._connect() as db:  # links live only on the newer record; derive the old one's state, never store it
         newer = [i for (i,) in db.execute("SELECT id FROM records WHERE id<>? AND EXISTS (SELECT 1 FROM json_each(payload,'$.supersedes') j WHERE j.value=?)", (r["id"], r["id"]))]
     if newer:

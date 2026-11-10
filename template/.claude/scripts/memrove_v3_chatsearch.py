@@ -366,6 +366,8 @@ def _bm25(live, q, top):
     for i in sorted(score, key=score.get)[:top]:
         rid, r, when = live[i]
         text = str(r.get("text") or r.get("title") or r.get("approach") or "")
+        if r.get("source_msg_id") is not None:
+            text = f"[msg {r['source_msg_id']}] {text}"   # zoom <id> 1 opens the source message
         out.append((score[i], (f"rec:{rid}", when, r.get("kind") or "", text)))
     return out
 
@@ -398,7 +400,7 @@ def _hybrid(state, query, top, rerank, since, until, session_notes, ref=None):
     lane = merged(state, query, DENSE_POOL, rerank, since, until, session_notes, hybrid=False, ref=ref)
     live = _live(state, since, until, session_notes)
     rows = {r[0]: r for r in lane}
-    by_id = {"rec:" + rid: ("rec:" + rid, when, r.get("kind") or "", str(r.get("text") or r.get("title") or r.get("approach") or "")) for rid, r, when in live}
+    by_id = {"rec:" + rid: ("rec:" + rid, when, r.get("kind") or "", (f"[msg {r['source_msg_id']}] " if r.get("source_msg_id") is not None else "") + str(r.get("text") or r.get("title") or r.get("approach") or "")) for rid, r, when in live}
     lists = [[r[0] for r in lane], _dense(state, query, live)]
     rule = os.environ.get("MEMROVE_HYBRID_RULE", "routed")   # routed (w2 for a Turkish query, bm25 for English), rrf (qmd), dense_first (dense top 3 then bm25), w2 (plain RRF, dense weight 2)
     if rule == "routed":
