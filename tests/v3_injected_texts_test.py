@@ -34,8 +34,8 @@ class InjectedTextsTest(unittest.TestCase):
 
     def test_rule_is_search_first(self):
         for t in (ct.INSTRUCTION, re.search(r"ONE_LINE = '(.*)'\n", CHAT_TS).group(1)):
-            self.assertIn("search first", t)
             self.assertIn("not evidence", t)
+        self.assertIn("search first", re.search(r"ONE_LINE = '(.*)'\n", CHAT_TS).group(1))
 
     def test_agents_block_has_no_stale_promises(self):
         src = (ROOT / "scripts/install_v3.py").read_text()

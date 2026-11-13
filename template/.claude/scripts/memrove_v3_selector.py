@@ -122,6 +122,20 @@ def _claude_file(llm, system, payload, usage):
     return (None, 0.0, "claude-error") if out.get("is_error") else (out.get("result"), float(out.get("total_cost_usd") or 0), None)
 
 
+RUN_STALE = 120   # seconds: a .run file older than the job's model timeout (60 s) plus margin belongs to a dead job
+
+
+def _running(run):
+    """True when `run` exists and is fresh; a stale one is removed."""
+    try:
+        if time.time() - run.stat().st_mtime < RUN_STALE:
+            return True
+        run.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
 def start(state, brief, project=None):
     """Detached background job for one brief; never raises, never waits."""
     try:
@@ -129,10 +143,14 @@ def start(state, brief, project=None):
             return
         p = out_path(state, key_of(brief))
         p.parent.mkdir(exist_ok=True)
-        if p.exists() or p.with_suffix(".run").exists():
+        run = p.with_suffix(".run")
+        if p.exists() or _running(run):
             return
-        p.with_suffix(".run").write_text(str(time.time()))
-        _spawn(state, p, brief, project)
+        run.write_text(str(time.time()))
+        try:
+            _spawn(state, p, brief, project)
+        except Exception:
+            run.unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -154,7 +172,7 @@ def wait(state, brief, seconds=6.0):
                 return json.loads(p.read_text(encoding="utf-8")).get("picks") or []
             except ValueError:
                 return []
-        if not p.with_suffix(".run").exists() or time.monotonic() > end:
+        if not _running(p.with_suffix(".run")) or time.monotonic() > end:
             return None
         time.sleep(0.1)
 

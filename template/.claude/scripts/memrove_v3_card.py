@@ -10,9 +10,8 @@ from pathlib import Path
 import sqlite3
 
 CAP = 1500   # bytes of the pushed block
-PROTOCOL = ('Handoff: when a meaningful piece of work ends (a decision, a correction or a finished change; not chit-chat, not every turn), '
-            'write your card once before the final reply: memrove card --did "<what>" --why "<why>" --open "<left open>" --next "<first step next time>" '
-            '(--did/--why/--open repeatable, 1-3 short items each).\n')
+PROTOCOL = ('Handoff: after a meaningful piece of work (not chit-chat), once before your final reply: '
+            'memrove card --did "<what>" --why "<why>" --open "<left open>" --next "<first step>" (repeatable, 1-3 short items).\n')
 SYSTEM = ("You write a handoff card for the next agent in 8 lines at most. Input: the owner's decision cues, first and last messages, last assistant text. "
           'Reply with JSON only: {"skip": false, "did": [<=3 strings], "why": [<=2], "open": [<=2], "next": "one sentence"}. '
           'English, facts only, each string under 110 chars, no padding. {"skip": true} when nothing was decided or left open.')

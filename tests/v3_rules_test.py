@@ -160,7 +160,11 @@ class RulesTest(unittest.TestCase):
         kw = dict(supersedes=["q-old"], source="notes/observed/preference/new.md")
         pending = store([rec("q-old", "preference", "x", "2026-10-12", assessments=judged(old)),
                          rec("obs-new", "preference", "Everything is English, but replies are in the user's language.", "2026-10-13", **kw)])
-        self.assertEqual(rules.block(pending, "demo").splitlines()[1:], ["- " + old])   # no gap while the correction waits
+        # the owner's correction is a rule at once, in its own words and with the old rule's scope; the old rule goes
+        self.assertEqual(rules.block(pending, "demo").splitlines()[1:], ["- Everything is English, but replies are in the user's language."])
+        cut = store([rec("q-old", "preference", "x", "2026-10-12", assessments=judged(old)),
+                     rec("obs-new", "preference", "Türkçe yanıt ver", "2026-10-13", **kw)])
+        self.assertEqual(rules.block(cut, "demo").splitlines()[1:], ["- " + old])   # no gap while an unusable correction waits
         done = store([rec("q-old", "preference", "x", "2026-10-12", assessments=judged(old)),
                       rec("obs-new", "preference", "x", "2026-10-13", assessments=judged(new), **kw)])
         self.assertEqual(rules.block(done, "demo").splitlines()[1:], ["- " + new])
@@ -352,39 +356,27 @@ class RulesTest(unittest.TestCase):
 
 
 class LoadedClaudeMdTest(unittest.TestCase):
-    def test_rule_already_in_a_loaded_claude_md_is_skipped_and_cap_is_6000(self):
+    def test_only_an_exact_normalized_match_in_claude_md_is_dropped_and_logged(self):
         from unittest.mock import patch
         home = Path(tempfile.mkdtemp(prefix="v3-home-"))
-        proj = home / "proj"
-        proj.mkdir()
-        (proj / "CLAUDE.md").write_text("- The d1 decision model runs always-on, never loaded or unloaded.\n")
-        d = store([rec("q-1", "preference", "x", "2026-10-01", assessments=judged("In proj, the d1 decision model runs always-on, never loaded or unloaded.", "project", "proj")),
-                   rec("q-2", "preference", "x", "2026-10-02", assessments=judged("In proj, the exporter must write one file per customer report.", "project", "proj"))])
+        (home / ".claude").mkdir()
+        # same words, other case, punctuation and line breaks: the normalized text matches
+        (home / ".claude" / "CLAUDE.md").write_text("# Rules\n- THE d1 decision model runs\n  always-on; never loaded or unloaded!\n")
+        d = store([rec("q-1", "preference", "x", "2026-10-01", assessments=judged("The d1 decision model runs always-on, never loaded or unloaded.")),
+                   # near match (one word differs): kept
+                   rec("q-2", "preference", "x", "2026-10-02", assessments=judged("The d1 decision model runs always-on, never loaded or unloaded today.")),
+                   rec("q-3", "preference", "x", "2026-10-03", assessments=judged("The exporter must write one file per customer report."))])
         with patch.object(Path, "home", return_value=home):
-            b = rules.block(d, "proj", cwd=str(proj))
-            self.assertNotIn("d1 decision", b)
+            b = rules.block(d, cwd=str(home))
+            self.assertNotIn("unloaded.\n", b.replace("today.", "X"))   # q-1 gone
+            self.assertIn("unloaded today.", b)                          # q-2 kept
             self.assertIn("exporter", b)
-            self.assertIn("d1 decision", rules.block(d, "proj"))   # no cwd: nothing is filtered
-            self.assertEqual([i for i, _, _ in rules.left_out(d, "proj", cwd=str(proj))], [])
-        self.assertEqual(rules.CAP, 6000)
-        many = store([rec(f"q-{i}", "preference", "x", "2026-10-%02d" % (i % 28 + 1),
-                          assessments=judged(f"The owner wants rule number {i} to hold with {'x' * 80} everywhere.")) for i in range(60)])
-        self.assertGreater(len(rules.block(many).encode()), 1500)
+            self.assertIn("d1 decision", rules.block(d))                 # no cwd: nothing is filtered
+        log = [json.loads(ln) for ln in (Path(d) / "rules-dropped.jsonl").read_text().splitlines()]
+        self.assertEqual([x["ids"] for x in log], [["q-1"]])
 
-    def test_negated_rule_is_not_skipped_and_stems_are_real(self):
-        line = rules._words("Claude must use pytest for all the tests in this repo.")
-        self.assertFalse(rules._in_loaded("Claude must not use pytest for tests in this repo.", [line]))
-        self.assertTrue(rules._in_loaded("Claude must use pytest for tests in this repo.", [line]))
-        self.assertTrue(rules._in_loaded("Never use pytest for tests in this repo.", [rules._words("Do not use pytest for tests in this repo.")]))
-        for neg in ("Claude doesn\u2019t use pytest for tests in this repo.", "Claude must avoid pytest for tests in this repo.", "Stop using pytest for tests in this repo."):
-            self.assertFalse(rules._in_loaded(neg, [line]), neg)   # curly apostrophe and avoid/stop are negations too
+    def test_words_stems(self):
         self.assertEqual(rules._words("needs add ids"), {"need", "add", "ids"})
-
-    def test_overlap_threshold_boundary(self):
-        line = [rules._words("alpha bravo charlie delta echo foxtrot golf hotel india juliet")]
-        self.assertTrue(rules._in_loaded("alpha bravo charlie delta echo foxtrot golf", line))     # 7/7 in line, 7 words
-        self.assertTrue(rules._in_loaded("alpha bravo charlie delta echo foxtrot golf kilo lima mike", line))   # 7/10 = 0.70
-        self.assertFalse(rules._in_loaded("alpha bravo charlie delta echo foxtrot kilo lima mike november", line))  # 6/10
 
 
 if __name__ == "__main__":

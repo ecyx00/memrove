@@ -172,11 +172,11 @@ class TopicHeads(unittest.TestCase):
         import memrove_v3_heads as H
         import memrove_v3_hook as hook
         payload = {"source": "compact", "cwd": str(self.proj)}
-        self.assertNotIn("heads", hook.session_notice(self.state, payload))
+        self.assertNotIn("heads", hook.session_start(self.state, payload, self.vault)[0])
         for i in range(7):
             (self.docs / f"2026-10-0{i + 1}-t{i}.md").write_text(f"---\ntopic: topic-{i}\nstatus: open\ndecision: decision number {i}\nnext: do {i}\n---\n")
-        self.assertNotIn("heads", hook.session_notice(self.state, {**payload, "source": "startup"}))  # heads are compaction-only
-        out = hook.session_notice(self.state, payload)
+        self.assertNotIn("heads", hook.session_start(self.state, {**payload, "source": "startup"}, self.vault)[0])  # heads are compaction-only
+        out = hook.session_start(self.state, payload, self.vault)[0]
         self.assertIn("[topic-6] open decision number 6 | next: do 6", out)
         self.assertIn("[topic-2]", out)
         self.assertNotIn("[topic-1]", out)
@@ -249,7 +249,7 @@ class TopicHeads(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MEMROVE_HEADS": "0"}):
             self.assertEqual(H.heads(self.state, "myproj"), ([], {}))
             self.assertEqual((H.render(self.state, "myproj"), H.topics(self.state, "myproj"), H.match(self.state, "a")), ([], [], []))
-            self.assertNotIn("heads", hook.session_notice(self.state, {"source": "startup", "cwd": str(self.proj)}))
+            self.assertNotIn("heads", hook.session_start(self.state, {"source": "startup", "cwd": str(self.proj)}, self.vault)[0])
         on = subprocess.run([sys.executable, str(ROOT / "scripts/memrove_v3.py"), "--vault", str(self.vault), "--state", str(self.state), "project", "myproj"], env=self.env, capture_output=True, text=True).stdout
         off = subprocess.run([sys.executable, str(ROOT / "scripts/memrove_v3.py"), "--vault", str(self.vault), "--state", str(self.state), "project", "myproj"], env=env, capture_output=True, text=True).stdout
         self.assertIn("heads (newest", on)

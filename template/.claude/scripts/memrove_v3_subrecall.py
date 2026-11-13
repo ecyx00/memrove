@@ -4,6 +4,7 @@
 Entry point for the SubagentStart hook (memrove_v3_jit) and for evals: `echo "<brief>" | python3 memrove_v3_subrecall.py --state STATE [--project P] [--json]`
 or `recall(state, brief, project)` / `block(state, brief, project)`. Stdlib only; read-only on the store except the brief stash.
 """
+import fcntl
 import json
 import re
 import sqlite3
@@ -228,6 +229,13 @@ def block(state, brief, project=None, picks=None, ids=None):
 
 # --- brief capture -------------------------------------------------------------------------------------------------
 
+def _locked(path):
+    """Exclusive lock for a read-modify-write of `path` (parallel Agent spawns in one message race on it)."""
+    f = open(str(path) + ".lock", "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f   # closing the file releases the lock
+
+
 def stash(state, payload):
     """PreToolUse(Agent): remember the brief for the SubagentStart that follows. Never raises."""
     try:
@@ -236,9 +244,11 @@ def stash(state, payload):
         if not isinstance(text, str) or not text.strip():
             return
         path = Path(state) / "agent-briefs.jsonl"
+        lock = _locked(path)
         keep = [l for l in (path.read_text(encoding="utf-8").splitlines() if path.exists() else []) if time.time() - json.loads(l)["t"] < STASH_TTL][-20:]
         keep.append(json.dumps({"t": time.time(), "session": payload.get("session_id"), "type": ti.get("subagent_type") or "general-purpose", "prompt": text[:6000]}, ensure_ascii=False))
         path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        lock.close()
         import memrove_v3_selector
         memrove_v3_selector.start(state, text, payload.get("project"))
     except Exception:
@@ -247,6 +257,11 @@ def stash(state, payload):
 
 def _from_stash(state, payload):
     path = Path(state) / "agent-briefs.jsonl"
+    with _locked(path):
+        return _take(path, payload)
+
+
+def _take(path, payload):
     rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     kind = str(payload.get("agent_type") or "").rsplit(":", 1)[-1]
     for r in rows:   # oldest unconsumed first: parallel spawns of one type start in spawn order

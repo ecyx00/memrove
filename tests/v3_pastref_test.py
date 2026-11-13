@@ -31,25 +31,19 @@ class TriggerTest(unittest.TestCase):
         for t in ("testleri çalıştır ve hataları düzelt", "add a retry to the fetcher", "bu fonksiyonu yeniden adlandır"):
             self.assertFalse(pr.is_past_reference(t), t)
 
-    def test_hook_line_only_when_flag_on(self):
-        payload = {"prompt": "geçen sefer ne demiştik?", "session_id": "s1"}
-        with patch.dict("os.environ", {"MEMROVE_PASTREF": "1"}):
-            self.assertEqual(hook.pastref_line(payload), pr.LINE)
-            self.assertEqual(hook.pastref_line({"prompt": "testleri çalıştır"}), "")
-        with patch.dict("os.environ", {}, clear=False):
-            import os
-            os.environ.pop("MEMROVE_PASTREF", None)
-            self.assertEqual(hook.pastref_line(payload), "")
-
-    def test_flag_file_enables_line(self):
-        payload = {"prompt": "geçen sefer ne demiştik?", "session_id": "s1"}
+    def test_hook_line_only_with_a_cue_and_once_per_session(self):
         import os
         os.environ.pop("MEMROVE_PASTREF", None)
+        payload = {"prompt": "geçen sefer ne demiştik?", "session_id": "s1"}
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(hook.pastref_line(payload, d), "")
-            (Path(d) / "pastref.on").write_text("")
-            self.assertEqual(hook.pastref_line(payload, d), pr.LINE)
-            self.assertEqual(hook.pastref_line({"prompt": "testleri çalıştır"}, d), "")
+            self.assertEqual(hook.pastref_line({"prompt": "testleri çalıştır", "session_id": "s1"}, d), "")   # no cue: silent
+            first = hook.pastref_line(payload, d)
+            self.assertTrue(first.startswith(pr.LINE))
+            self.assertLessEqual(len(first), 300)
+            self.assertEqual(hook.pastref_line(payload, d), "")                                      # same session: never again
+            self.assertEqual(hook.pastref_line({**payload, "session_id": "s2"}, d), first)           # new session: once more
+        with patch.dict("os.environ", {"MEMROVE_PASTREF": "0"}):
+            self.assertEqual(hook.pastref_line(payload), "")
 
 
 class RebriefTest(unittest.TestCase):

@@ -898,10 +898,12 @@ def date_of(state, i):
     return datetime.fromisoformat(r["date"]).strftime("%Y-%m-%d %H:%M:%S %z")
 
 
-INSTRUCTION = """Memrove chat memory is on: every past user message and agent reply, from all sessions, summarized into a map.
-Before you answer or start a task that may build on earlier work, search first; a hit or a doc line is a lead, not evidence; open it with zoom or memrove doc and answer from what you opened. On one topic the newer statement wins, and the user's word beats an agent's.
-- `memrove search "<words>"` finds messages and the saved decisions, lessons and notes (`rec:<id>` lines; `memrove show <id>` opens one with its why).
-- `memrove wake` prints the map (more parts: `memrove wake 2`, ...); each line is `id+n|summary` of the n messages from id on. `memrove zoom <id> <n>` opens it into the two lines it was made from (n=1 gives the message whole); `memrove date <id>` gives its date."""
+INSTRUCTION = """Memrove chat memory is on: all past sessions (usage note):
+- search: `memrove search "<words>"` finds messages and saved records; `memrove show <id>` opens a record
+- wake: `memrove wake [n]` prints the map, lines `id+n|summary`
+- zoom: `memrove zoom <id> <n>` opens a line into its messages
+- verify drift-prone facts before relying on them; a hit is a lead, not evidence
+- the owner's words beat an agent's; newer beats older"""
 
 
 def instruction(state):

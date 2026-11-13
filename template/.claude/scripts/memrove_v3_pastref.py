@@ -1,6 +1,6 @@
 """Owner-prompt classifiers over the chat log (stdlib only).
 
-1. Past-reference trigger: does the prompt point back at earlier work? If so (and MEMROVE_PASTREF=1) the prompt hook adds one line,
+1. Past-reference trigger: does the prompt point back at earlier work? If so (unless MEMROVE_PASTREF=0) the prompt hook adds one line,
    no content: search before answering, then open the hits.
 2. Re-brief detector (metric 0): owner prompts that ask for the same thing again in another session (BM25 over the chat log).
 """
@@ -11,7 +11,7 @@ import re
 from collections import Counter, defaultdict
 from datetime import datetime
 
-LINE = "This prompt may build on earlier work: search first; a hit or a doc line is a lead, not evidence; open it with zoom or memrove doc and answer from what you opened."
+LINE = "memrove: this prompt may build on earlier work."   # fixed prefix: memrove_v3_realuse finds the line in transcripts by it
 
 # Turkish fold for past-reference detection (dotted/dotless i, diacritics).
 _FOLD = str.maketrans({"İ": "i", "I": "ı", "ı": "i", "ş": "s", "ğ": "g", "ü": "u", "ö": "o", "ç": "c"})
@@ -63,10 +63,18 @@ def is_past_reference(text):
     return any(r.search(t) for r in RULES)
 
 
+def line(text):
+    """The one UserPromptSubmit line for a prompt with a past-reference cue (cue terms only, no search: 0 ms), or ''."""
+    if not is_past_reference(text):
+        return ""
+    terms = " ".join(list(dict.fromkeys(t for t in tokens(text) if len(t) >= 4))[:5])
+    return LINE + (f' terms: {terms}. Check `memrove search "{terms}"`; a hit is a lead, open it before relying on it.' if terms else "")
+
+
 def hint(text, env=None):
-    """The one line to add to a UserPromptSubmit context, or '' (flag off, or no past reference)."""
+    """`line(text)` unless MEMROVE_PASTREF=0."""
     env = os.environ if env is None else env
-    return LINE if env.get("MEMROVE_PASTREF") == "1" and is_past_reference(text) else ""
+    return "" if env.get("MEMROVE_PASTREF") == "0" else line(text)
 
 
 # ---- owner prompts + re-brief detector -----------------------------------------------------------------------------

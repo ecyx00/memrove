@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 
 CAP = 6000          # bytes of the whole block, session and subagent alike: a rule works only in context, so the cap guards a runaway count, it does not ration rules (3000 left 7-20 rules of a busy project out)
 MAX_WORDS, MAX_CHARS = 40, 200
@@ -18,13 +19,20 @@ TURKISH = re.compile("[çğıöşüÇĞİÖŞÜ]")
 BARE = re.compile(r"^(?:don'?t|do|no|never|always|not|stop|avoid)\b", re.I)   # an imperative or a negation has no subject
 KINDS = ("preference", "decision", "rejected")
 GENERIC = ("", "unknown", ".claude", Path.home().name)   # labels of sessions started in the home directory: no project
-LOADED_MIN, LOADED_SIM = 3, 0.70   # a rule is skipped when >=70% of its content words sit in one line of a loaded CLAUDE.md (real rules: verbatim copies score 0.83-1.0, the nearest paraphrases 0.67 and below)
+LOADED_MIN = 3   # content words a sentence needs for the duplicate check between rules
 FILLER = frozenset("the a an of to in on is are be and or for with that this it its as at by from do does owner wants want claude when only any all new own must should stay stays will may used use given give personal intelligence".split())
 HEAD = "Standing rules (owner's own; binding; newest wins):\n"
 
 
 def _when(r):
     return str(r.get("valid_from") or r.get("recorded_at") or r.get("updated_at") or "")   # the day the owner said it; updated_at moves with every re-assessment
+
+
+def _ids(v):
+    """supersedes as a list (the store may hold a JSON or Python-literal string)."""
+    if isinstance(v, list):
+        return v
+    return re.findall(r"[\w-]+-[0-9a-f]{8,}", str(v or ""))
 
 
 def _own(r):
@@ -41,10 +49,12 @@ def _restated(r):
     a = ((r.get("assessments") or {}).get("restate") or {})
     ans = a.get("answers") or {}
     sent = " ".join(str(ans.get("sentence") or "").split())
+    hand = str(r.get("rule_scope") or "").strip()   # set by the owner (memrove rule-scope): wins over the model's judgement
+    if a.get("state") != "assessed" and hand and _own(r):   # an owner rule scoped by hand is a rule now, in its own words; it does not wait for the restate step
+        a, ans, sent = {"state": "assessed"}, {"standing_rule": "yes"}, " ".join(str(r.get("text") or "").split())
     if a.get("state") != "assessed" or ans.get("standing_rule") != "yes" or not sentence_ok(sent):
         return None
     scope, proj = ans.get("scope"), str(ans.get("project") or "").strip()
-    hand = str(r.get("rule_scope") or "").strip()   # set by the owner (memrove rule-scope): wins over the model's judgement
     if hand:
         scope, proj = ("global", "") if hand == "global" else ("project", hand)
     if scope not in ("global", "project") or (scope == "project" and not proj):
@@ -81,8 +91,13 @@ def _words(s):
     return out
 
 
-def loaded_lines(cwd):
-    """-> word sets of every sentence of the CLAUDE.md files a session in cwd loads: ~/.claude/CLAUDE.md, and CLAUDE.md from cwd up to home."""
+def _flat(s):
+    """lowercase, every run of whitespace/punctuation collapsed to one space."""
+    return " ".join(re.sub(r"[\W_]+", " ", str(s).lower()).split())
+
+
+def loaded_text(cwd):
+    """-> the flattened text of the CLAUDE.md files a session in cwd loads: ~/.claude/CLAUDE.md, and CLAUDE.md from cwd up to home."""
     home, files = Path.home(), [Path.home() / ".claude" / "CLAUDE.md"]
     if cwd:
         d = Path(cwd).expanduser().resolve()
@@ -94,19 +109,13 @@ def loaded_lines(cwd):
     out = []
     for f in dict.fromkeys(files):
         try:
-            out += [w for w in map(_words, (t for ln in f.read_text().splitlines() for t in [ln, *re.split(r"(?<=[.!?])\s+", ln)])) if w]   # each line and each of its sentences: a negated sentence must not flip its neighbour, a "X. It does not Y." line still matches "X, not Y"
+            out.append(_flat(f.read_text()))
         except OSError:
             pass
-    return out
+    return " " + " ".join(out) + " "
 
 
-def _in_loaded(sentence, lines):
-    w = _words(sentence)
-    n = len(w - {NEG})
-    return n >= LOADED_MIN and any((NEG in w) == (NEG in l) and len(w & l - {NEG}) / n >= LOADED_SIM for l in lines)
-
-
-def rules(state, project=None, global_only=False, cwd=None):
+def rules(state, project=None, global_only=False, cwd=None, dropped=None):
     """-> [(when, project_tag, sentence, id)]: project and global rules take turns, most-repeated then newest first. Duplicates and reversals are marked by the restate step (restate_dup_of)."""
     path = Path(state) / "memory.sqlite3"
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
@@ -116,7 +125,7 @@ def rules(state, project=None, global_only=False, cwd=None):
     finally:
         db.close()
     for r in rows:   # a correction is never a duplicate of the rule it replaces, even when the merge step marked it so
-        if r.get("restate_dup_of") in (r.get("supersedes") or []):
+        if r.get("restate_dup_of") in _ids(r.get("supersedes")):
             r["restate_dup_of"] = None
     dup = {r["id"]: r["restate_dup_of"] for r in rows if r.get("restate_dup_of")}
     said = {}   # how often the owner said a rule: the records merged into it, followed to the root
@@ -125,9 +134,16 @@ def rules(state, project=None, global_only=False, cwd=None):
         while root in dup and hops < 20:
             root, hops = dup[root], hops + 1
         said[root] = said.get(root, 0) + 1
+    by_id = {r["id"]: r for r in rows}
+    for r in rows:   # an owner correction (--supersedes) of a rule keeps the old rule's scope until the restate step judges it
+        if not r.get("rule_scope") and ((r.get("assessments") or {}).get("restate") or {}).get("state") != "assessed" and _own(r):
+            old = next((x for x in (by_id.get(s) for s in _ids(r.get("supersedes"))) if x and _restated(x)), None)
+            if old:
+                _, scope, proj = _restated(old)
+                r["rule_scope"] = "global" if scope == "global" else proj
     rows = [(r, _restated(r)) for r in rows if _own(r) and _live(r)]
     rows = [(r, x) for r, x in rows if x]
-    gone = {s for r, _ in rows for s in (r.get("supersedes") or [])}   # a correction hides the old rule only once it is itself a restated rule: a pending one would leave a gap
+    gone = {s for r, _ in rows for s in _ids(r.get("supersedes"))}   # a correction hides the old rule only once it is itself a restated rule: a pending one would leave a gap
     # global: scope global; a project rule only for a session of that project (never in the subagent form)
     mine = [(r, x) for r, x in rows if r["id"] not in gone and (x[1] == "global" or (not global_only and project and _norm(x[2]) == _norm(project)))]
     # project rules and global rules take turns, each list ordered by how often the owner said the rule, then newest first:
@@ -135,9 +151,12 @@ def rules(state, project=None, global_only=False, cwd=None):
     mine.sort(key=lambda t: (-said.get(t[0]["id"], 0), _neg(_when(t[0]))))
     lists = [[t for t in mine if t[1][1] != "global"], [t for t in mine if t[1][1] == "global"]]
     order = [t for pair in zip_longest(*lists) for t in pair if t]
-    if cwd:   # a rule the loaded CLAUDE.md files already say needs no second push
-        lines = loaded_lines(cwd)
-        order = [t for t in order if not _in_loaded(t[1][0], lines)]
+    if cwd:   # a rule whose normalized text sits whole in a loaded CLAUDE.md needs no second push; its id goes to `dropped`
+        text = loaded_text(cwd)
+        gone_ids = [t for t in order if f" {_flat(t[1][0])} " in text]
+        order = [t for t in order if t not in gone_ids]
+        if dropped is not None:
+            dropped.extend(t[0]["id"] for t in gone_ids)
     kept, seen = [], []   # the merge step misses some duplicates (two records restated to one sentence): one line per rule
     for t in order:
         w = _words(t[1][0])
@@ -166,9 +185,16 @@ def block(state, project=None, global_only=False, cap=None, cwd=None, ids=None):
         return ""
     cap = cap or CAP
     try:
-        items = rules(state, project, global_only, cwd)
+        dropped = []
+        items = rules(state, project, global_only, cwd, dropped)
     except Exception:
         return ""
+    if dropped:   # audit trail: every dropped rule has an exact normalized match in CLAUDE.md
+        try:
+            with open(Path(state) / "rules-dropped.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": round(time.time(), 3), "ids": dropped}) + "\n")
+        except OSError:
+            pass
     lines = ["- " + rule + "\n" for _, _, rule, _ in items]
     notice = lambda n: f"- ({n} more rule{'s' * (n > 1)} left out by the size cap; list them: memrove rules --left-out" + (f" --project '{project}'" if project else "") + ")\n"
     size = lambda xs: sum(len(x.encode()) for x in xs)
@@ -184,7 +210,11 @@ def block(state, project=None, global_only=False, cap=None, cwd=None, ids=None):
 
 def left_out(state, project=None, cwd=None):
     """-> [(id, project_tag, sentence)] the SessionStart block leaves out for this project (what `memrove rules --left-out` lists)."""
-    shown = len([ln for ln in block(state, project, cwd=cwd).splitlines()[1:] if not ln.startswith("- (")])
+    try:   # the cap the last SessionStart used for this project (the hook gives rules the room other slots leave)
+        cap = json.loads((Path(state) / "rules-cap.json").read_text(encoding="utf-8")).get(project or "")
+    except (OSError, ValueError):
+        cap = None
+    shown = len([ln for ln in block(state, project, cap=cap, cwd=cwd).splitlines()[1:] if not ln.startswith("- (")])
     return [(i, tag, rule) for _, tag, rule, i in rules(state, project, cwd=cwd)[shown:]]
 
 

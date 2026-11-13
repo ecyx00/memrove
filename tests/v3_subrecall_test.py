@@ -130,7 +130,7 @@ class HookTest(unittest.TestCase):
         ctx = self.run_hook({"hook_event_name": "SubagentStart", "session_id": "s1", "agent_type": "coder"}, d)
         self.assertIn("Everything Claude writes is English.", ctx)
         ctx = self.run_hook({"hook_event_name": "SubagentStart", "agent_type": "coder"}, d, MEMROVE_SUBRECALL="0")
-        self.assertIn("Before you answer or start a task", ctx)   # today's long rule
+        self.assertIn("Memory usage note", ctx)   # the one usage note (<= 500 chars)
 
     def test_brief_from_transcript(self):
         t = Path(tempfile.mkdtemp()) / "agent-x.jsonl"

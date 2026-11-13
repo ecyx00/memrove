@@ -64,9 +64,10 @@ class PastrefPointersGate(unittest.TestCase):
         payload = {"prompt": "geçen sefer ne demiştik?", "session_id": "s1"}
         with patch.dict("os.environ", {"MEMROVE_PASTREF": "1"}), patch.object(hook, "doc_pointers", return_value="\nPOINTERS"):
             os.environ.pop("MEMROVE_PASTREF_POINTERS", None)
-            self.assertEqual(hook.pastref_line(payload), pr.LINE)
+            plain = hook.pastref_line(payload)
+            self.assertTrue(plain.startswith(pr.LINE))
             os.environ["MEMROVE_PASTREF_POINTERS"] = "1"
-            self.assertEqual(hook.pastref_line(payload), pr.LINE + "\nPOINTERS")
+            self.assertEqual(hook.pastref_line(payload), plain + "\nPOINTERS")
 
 
 if __name__ == "__main__":

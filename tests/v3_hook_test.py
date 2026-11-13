@@ -205,7 +205,7 @@ class HookTest(unittest.TestCase):
         self.assertEqual(rh.call_args.args[2:], ("claude",))  # production used to leave the default
 
     def test_session_start_carries_the_notice(self):
-        notice = self.hook.session_notice(self.state, {"source": "clear"})
+        notice = self.hook.session_start(self.state, {"source": "clear"}, self.vault)[0]
         self.assertIn("lead, not evidence", notice)
 
     def test_compact_start_carries_the_owners_recent_words(self):
@@ -222,19 +222,19 @@ class HookTest(unittest.TestCase):
         path = self.root / "t.jsonl"
         path.write_text("\n".join(lines), encoding="utf-8")
         payload = {"source": "compact", "transcript_path": str(path), "cwd": str(self.vault)}
-        text = self.hook.session_notice(self.state, payload)
+        text = self.hook.session_start(self.state, payload, self.vault)[0]
         for gone in ("TOOL_OUT", "REMINDER", "SUMMARY", "subagent words", "AGENT_REPLY"):
             self.assertNotIn(gone, text)
         self.assertLess(text.index("first prompt"), text.index("second"))
         self.assertLess(text.index("second"), text.index("third prompt"))
-        self.assertIn("second " + "y" * 693 + " [cut: 207 more chars]", text)  # 700 chars kept, then the marker
-        self.assertNotIn("y" * 694, text)
+        self.assertIn("second " + "y" * 293 + " [cut: 607 more chars]", text)  # 300 chars kept, then the marker
+        self.assertNotIn("y" * 294, text)
         tail = self.hook.recent_words(path, budget=250)  # over budget: newest kept, oldest dropped
         self.assertIn("third prompt", tail)
         self.assertNotIn("first prompt", tail)
         self.assertLessEqual(len(tail), 250)
-        self.assertNotIn("recent words", self.hook.session_notice(self.state, {**payload, "source": "resume"}))
-        self.assertNotIn("recent words", self.hook.session_notice(self.state, {**payload, "source": "startup"}))
+        self.assertNotIn("recent words", self.hook.session_start(self.state, {**payload, "source": "resume"}, self.vault)[0])
+        self.assertNotIn("recent words", self.hook.session_start(self.state, {**payload, "source": "startup"}, self.vault)[0])
 
     def test_installer_ships_the_model_daemon_and_the_grab_panel(self):
         out = subprocess.run([sys.executable, str(INSTALLER), "--vault", str(self.vault), "--state", str(self.state)],

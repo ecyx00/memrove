@@ -115,15 +115,24 @@ def expose(state, payload, path, ids, slot):
 
 
 def pastref_line(payload, state=None):
-    """A one-line pointer for a prompt that refers to earlier work. Off unless MEMROVE_PASTREF=1 or <state>/pastref.on exists."""
+    """The one UserPromptSubmit line for a prompt that refers to earlier work, else ''. On unless MEMROVE_PASTREF=0.
+    A seen-list per session (<state>/prompt-seen/<session>) keeps the same line from being sent twice."""
     try:
-        enabled = os.environ.get("MEMROVE_PASTREF") == "1" or (state and (Path(state) / "pastref.on").exists())
-        if not enabled or is_synthetic_prompt(payload):
+        if os.environ.get("MEMROVE_PASTREF") == "0" or is_synthetic_prompt(payload):
             return ""
-        from memrove_v3_pastref import LINE, is_past_reference
-        if not is_past_reference(prompt_text(payload)):
+        from memrove_v3_pastref import line
+        text = line(prompt_text(payload))
+        if not text:
             return ""
-        return LINE + (doc_pointers(payload, state) if os.environ.get("MEMROVE_PASTREF_POINTERS") == "1" else "")   # pointers cost 2.3 s against the 2 s hook timeout and were never opened
+        if state:
+            seen = Path(state) / "prompt-seen" / session_key(payload)
+            mark = hashlib.sha256(text.encode()).hexdigest()[:16]
+            if seen.is_file() and mark in seen.read_text().split():
+                return ""
+            seen.parent.mkdir(parents=True, exist_ok=True)
+            with open(seen, "a") as f:
+                f.write(mark + "\n")
+        return text + (doc_pointers(payload, state) if os.environ.get("MEMROVE_PASTREF_POINTERS") == "1" else "")   # pointers cost 2.3 s against the 2 s hook timeout and were never opened
     except Exception:
         return ""
 
@@ -399,10 +408,28 @@ def claude_md_warning(path=None):
     return f"CLAUDE.md is {over} bytes over budget: convert a rule to a check or remove one\n" if over > 0 else ""
 
 
-TAIL_CAP, TAIL_MSG, TAIL_READ, CONTEXT_CAP = 6000, 700, 8 << 20, 9800  # recent-words block, per message, transcript bytes read, SessionStart text (host cap 10000)
+# One budget table, in bytes of memrove's own text (other plugins and CLAUDE.md are outside it). Host cap is 10,000 chars per hook; over it the text is
+# replaced by a stub, so every slot writer gets its own number and cuts at a line. heads = what is left of `total` (compact only).
+BUDGET = {
+    "startup": {"total": 4000, "status": 400, "usage": 500, "rules": 2500, "card": 600, "notes": 0, "words": 0},
+    "compact": {"total": 6000, "status": 200, "usage": 500, "rules": 2500, "card": 600, "notes": 0, "words": 2000},
+}
+TAIL_MSG, TAIL_READ = 300, 8 << 20   # per owner message in the recent-words slot, transcript bytes read
 
 
-def recent_words(path, budget=TAIL_CAP, each=TAIL_MSG):
+def fit(text, cap):
+    """text cut at a line boundary to at most `cap` bytes."""
+    if len(text.encode()) <= cap:
+        return text
+    out = ""
+    for ln in text.splitlines(True):
+        if len((out + ln).encode()) > cap:
+            break
+        out += ln
+    return out
+
+
+def recent_words(path, budget, each=TAIL_MSG):
     """The owner's last typed prompts of this session, oldest first, verbatim, each cut to `each` chars, newest kept when over `budget`. '' when none."""
     from memrove_v3_capture import has_secret, user_text
     try:
@@ -431,35 +458,83 @@ def recent_words(path, budget=TAIL_CAP, each=TAIL_MSG):
     return head + "".join(reversed(picked)) if picked else ""
 
 
-def session_notice(state, payload, reserve=0):
-    """Text for SessionStart: heartbeat line plus the pull-memory instruction for this start source.
-    `reserve` = chars the caller appends after; on compact the owner's recent words come before the heads view and the whole stays under CONTEXT_CAP."""
-    from memrove_v3_heartbeat import line
-    notice, source = line(state), payload.get("source")
-    if source in ("startup", "compact"):
+def session_start(state, payload, vault, harness="claude"):
+    """SessionStart text and its slots -> (text, {slot: text}). Each slot is cut to its BUDGET number, the whole to `total`."""
+    src = payload.get("source")
+    b = BUDGET["compact" if src == "compact" else "startup"]
+    slots = {}
+
+    def slot(name, make, cap):
         try:
+            slots[name] = fit(make(), cap)
+        except Exception:   # one broken slot never costs the others
+            slots[name] = ""
+
+    def status():
+        from memrove_v3_heartbeat import line
+        text = line(state) + health_warning(state) + claude_md_warning()
+        try:
+            from memrove_v3_checks import notice as stale_notice
+            text += stale_notice(state)
+        except Exception:
+            pass
+        return text
+
+    def usage():
+        if src in ("startup", "compact"):
             from memrove_v3_chattree import instruction
-            notice += instruction(state)
-        except Exception:  # no chat memory here: nothing to announce
-            pass
-    elif source in ("resume", "clear"):
+            return instruction(state)
         from memrove_v3_jit import RULE
-        notice += RULE + "\n"
-    try:
-        from memrove_v3_checks import notice as stale_notice
-        notice += stale_notice(state)
-    except Exception:  # a broken cache never costs the start notice
-        pass
-    if source == "compact" and payload.get("transcript_path"):
-        try:
-            notice += recent_words(payload["transcript_path"], min(TAIL_CAP, CONTEXT_CAP - reserve - len(notice)))
-        except Exception:  # the tail never costs the start notice
+        return RULE + "\n" if src in ("resume", "clear") else ""
+
+    def rules(cap):
+        from memrove_v3_rules import block
+        from memrove_v3_project import project_name
+        shown = []
+        text = block(state, project_name(payload.get("cwd"), state, vault), cap=cap, cwd=payload.get("cwd"), ids=shown)   # standing rules are pushed text (a rule works by being in context)
+        expose(state, payload, "rules", shown, "rules")
+        try:   # `memrove rules --left-out` lists what this cap left out
+            p = Path(state) / "rules-cap.json"
+            caps = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+            caps[project_name(payload.get("cwd"), state, vault) or ""] = cap
+            p.write_text(json.dumps(caps), encoding="utf-8")
+        except (OSError, ValueError):
             pass
-    if source != "compact":  # heads are pull-able (memrove search); only a compaction loses context they help restore
-        return notice
-    from memrove_v3_heads import start_view  # the project's newest topic heads, inside the same view
-    heads = start_view(state, payload.get("cwd") or ".")
-    return notice + (heads if len(notice) + len(heads) + reserve <= CONTEXT_CAP else "")
+        return text
+
+    def card():
+        from memrove_v3_card import block, PROTOCOL
+        from memrove_v3_project import project_name
+        text = block(state, project_name(payload.get("cwd"), state, vault), cap=b["card"] - len(PROTOCOL.encode()))
+        expose(state, payload, "card", re.findall(r"handoff card (\S+):\n", text), "card")
+        return text + PROTOCOL   # the project's last handoff card, then how to write the next one
+
+    slot("status", status, b["status"])
+    slot("usage", usage, b["usage"])
+    if harness == "claude":   # rules are binding: they get every byte the other start slots leave, never less than their own budget
+        slots["rules"] = ""
+        slot("card", card, b["card"])
+        warn = "Standing rules no longer fit the start block: merge or retire some (memrove rules --left-out).\n"
+        room = max(b["rules"], b["total"] - b["words"] - len(warn.encode()) - sum(len(v.encode()) for v in slots.values()))
+        slot("rules", lambda: rules(room), room)
+        if "left out by the size cap" in slots["rules"]:
+            slots["status"] = slots.get("status", "") + warn
+    if src == "compact" and payload.get("transcript_path"):
+        slot("words", lambda: recent_words(payload["transcript_path"], b["words"]), b["words"])
+    if src == "compact":   # heads are pull-able (memrove search); only a compaction loses context they help restore
+        from memrove_v3_heads import start_view
+        slot("heads", lambda: start_view(state, payload.get("cwd") or ".", cap=b["total"]), b["total"] - sum(len(v.encode()) for v in slots.values()))
+    return fit("".join(slots.values()), b["total"]), slots
+
+
+def emit(state, event, payload, out, slots=None):
+    """Print the hook output and log its size (bytes of additionalContext) to <state>/hook-size.jsonl."""
+    print(out)
+    try:
+        from memrove_v3_sizelog import log
+        log(state, event, payload.get("source"), len(json.loads(out).get("hookSpecificOutput", {}).get("additionalContext", "").encode()), slots)
+    except Exception:
+        pass
 
 
 def spawn_worker(vault, state, harness):
@@ -498,7 +573,7 @@ def main():
         outcome = run_worker(vault, state) if args.worker else drain_queue(vault, state)
         print(json.dumps(outcome))
         raise SystemExit(1 if outcome["failed"] else 0)
-    event, notice = args.event, ""
+    event, notice, slots = args.event, "", {}
     try:
         payload = json.loads(sys.stdin.read(1 << 20) or "{}")
         event = payload["hook_event_name"] = payload.get("hook_event_name", args.event)
@@ -515,42 +590,22 @@ def main():
             if line:
                 cards = json.loads(out).get("hookSpecificOutput", {}).get("additionalContext", "")
                 out = json.dumps(output_context(event, (cards + "\n" if cards else "") + line))
-            print(out)
+            emit(state, event, payload, out)
             return
         if not args.metadata_only:
             if event == "SessionStart":
-                notice = health_warning(state) + claude_md_warning()
-                if args.harness == "claude":
-                    try:  # standing rules are pushed text (a rule works by being in context)
-                        from memrove_v3_rules import block as rules_block
-                        from memrove_v3_project import project_name
-                        shown = []
-                        notice += rules_block(state, project_name(payload.get("cwd"), state, vault), cwd=payload.get("cwd"), ids=shown)
-                        expose(state, payload, "rules", shown, "rules")
-                    except Exception:
-                        pass
-                    try:  # the handoff card of the project's last session
-                        from memrove_v3_card import block as card_block
-                        from memrove_v3_project import project_name
-                        text = card_block(state, project_name(payload.get("cwd"), state, vault))
-                        notice += text
-                        expose(state, payload, "card", re.findall(r"handoff card (\S+):\n", text), "card")
-                        from memrove_v3_card import PROTOCOL
-                        notice += PROTOCOL
-                    except Exception:
-                        pass
-                notice = session_notice(state, payload, reserve=len(notice)) + notice
+                notice, slots = session_start(state, payload, vault, args.harness)
             elif event == "UserPromptSubmit":
                 notice = pastref_line(payload, state)
         if read_only:
-            print(json.dumps(output_context(event, notice)) if notice else "{}")
+            emit(state, event, payload, json.dumps(output_context(event, notice)) if notice else "{}", slots)
             return
         settings = read(vault)
         if settings["auto_sync"]:  # manual profile: no queueing, no worker
             enqueue_event(vault, state, payload, args.harness)
             if os.environ.get("MEMROVE_V3_NO_SPAWN") != "1" and (event in ("PreCompact", "SessionEnd") or claim_check(state, settings, event)):
                 spawn_worker(vault, state, args.harness)
-        print(json.dumps(output_context(event, notice)) if notice else "{}")
+        emit(state, event, payload, json.dumps(output_context(event, notice)) if notice else "{}", slots)
     except Exception as exc:
         note_error(state, exc)
         if not args.metadata_only and event in ("SessionStart", "UserPromptSubmit"):

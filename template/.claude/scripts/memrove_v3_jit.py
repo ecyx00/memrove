@@ -7,17 +7,13 @@ import json
 import sys
 from pathlib import Path
 
-RULE = (
-    "Before you answer or start a task that may build on earlier work, search first; a hit or a doc line is a lead, not evidence; "
-    "open it with zoom or memrove doc and answer from what you opened. On one topic the newer statement wins, and the user's word beats an agent's. "
-    "Start every docs/state write-up with front matter: topic (slug), status (open|done|rejected), decision (one sentence with why), next (one line)."
-)
-SUBAGENT_RULE = RULE + ' Without the MCP tools use the CLI: memrove search "<words>" / memrove zoom <id> <n>.'
-SHORT_RULE = ('Search memory before you start (memrove search "<words>" / memrove zoom <id> <n>); a hit is a lead: open it before you rely on it. '
-              "The newer statement wins and the owner's word beats an agent's. Start every docs/state write-up with front matter: topic (slug), status (open|done|rejected), decision (one sentence with why), next (one line).")
+RULE = ('Memory usage note: search before work that may build on earlier work (memrove search "<words>", memrove zoom <id> <n>); '
+        "a hit is a lead, not evidence: open it before relying on it. Verify drift-prone facts first. Newer beats older; the owner's word beats an agent's. "
+        "docs/state write-ups start with front matter: topic (slug), status (open|done|rejected), decision (one sentence with why), next.")
+SUBAGENT_RULE = SHORT_RULE = RULE   # one text, <= 500 chars
 RECALL_SECONDS = 2
 import os
-SELECTOR_SECONDS = float(os.environ.get("MEMROVE_SELECTOR_WAIT") or 2)   # 6 once the SubagentStart hook timeout is 9 s (install_v3 sets it); the live settings still say 3 s
+SELECTOR_SECONDS = float(os.environ.get("MEMROVE_SELECTOR_WAIT") or 2)   # install_v3 sets MEMROVE_SELECTOR_WAIT=9 with a 12 s SubagentStart hook timeout
 ASK_HINT = ("Before you ask the owner, check memory: `memrove search` for this decision; "
             "the owner should not have to repeat a settled answer.")
 # One-lookup and UI agents (scout, Explore, ui-reviewer) get nothing.
@@ -215,6 +211,13 @@ def main():
     except Exception:
         out = None
     print(json.dumps(out) if out else "{}")
+    try:
+        if out and out.get("hookSpecificOutput", {}).get("hookEventName") == "SubagentStart" and state:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from memrove_v3_sizelog import log
+            log(state, "SubagentStart", None, len(out["hookSpecificOutput"]["additionalContext"].encode()))
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
