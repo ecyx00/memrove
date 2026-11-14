@@ -218,15 +218,18 @@ class HookTest(unittest.TestCase):
                  rec("user", "subagent words", isSidechain=True),
                  rec("assistant", "AGENT_REPLY"),
                  rec("user", "second " + "y" * 900),
+                 rec("user", "Here is a note offered by a side agent:\n\n> Heads up · SIDE_NOTE_BODY\n>\n> - more\n\nowner tail words"),
+                 rec("user", "Here is a note offered by a side agent:\n\n> Heads up · ONLY_A_NOTE"),
                  rec("user", "third prompt")]
         path = self.root / "t.jsonl"
         path.write_text("\n".join(lines), encoding="utf-8")
         payload = {"source": "compact", "transcript_path": str(path), "cwd": str(self.vault)}
         text = self.hook.session_start(self.state, payload, self.vault)[0]
-        for gone in ("TOOL_OUT", "REMINDER", "SUMMARY", "subagent words", "AGENT_REPLY"):
+        for gone in ("TOOL_OUT", "REMINDER", "SUMMARY", "subagent words", "AGENT_REPLY", "SIDE_NOTE_BODY", "ONLY_A_NOTE", "side agent"):
             self.assertNotIn(gone, text)
         self.assertLess(text.index("first prompt"), text.index("second"))
         self.assertLess(text.index("second"), text.index("third prompt"))
+        self.assertIn("- owner tail words\n", text)   # the owner's own words after a side-agent note stay
         self.assertIn("second " + "y" * 293 + " [cut: 607 more chars]", text)  # 300 chars kept, then the marker
         self.assertNotIn("y" * 294, text)
         tail = self.hook.recent_words(path, budget=250)  # over budget: newest kept, oldest dropped

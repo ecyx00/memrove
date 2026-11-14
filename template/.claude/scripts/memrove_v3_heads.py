@@ -276,8 +276,11 @@ def check(state, path, text=None):
         for e in sorted(items, key=lambda e: (e["day"], e["ts"]), reverse=True):  # explicit keys only, newest first
             if e["keyed"] and e["topic"] not in known:
                 known.append(e["topic"])
-        query = _terms(path.stem.replace("-", " ") + " " + (mine["decision"] if mine else "") + " " + (fm.get("topic") or "").replace("-", " "))
-        scored = sorted(((-len(query & _terms(t.replace("-", " "))), t) for t in known if t != slug(fm.get("topic"))), key=lambda s: s[0])
+        name = _terms(path.stem.replace("-", " ") + " " + (fm.get("topic") or "").replace("-", " "))
+        query = name | _terms(mine["decision"] if mine else "")
+        # near = shares a word with this file's own name, or two words with its decision: one common decision word ("model") is not a topic match
+        scored = sorted(((-len(query & _terms(t.replace("-", " "))), t) for t in known if t != slug(fm.get("topic"))
+                         if name & _terms(t.replace("-", " ")) or len(query & _terms(t.replace("-", " "))) >= 2), key=lambda s: s[0])
         near = [t for n, t in scored if n < 0][:3]
         if not {"topic", "status", "decision", "next"} <= set(fm):
             return "write-up needs " + FM_LINE + (f"; existing topics: {', '.join(near)}" if near else "")

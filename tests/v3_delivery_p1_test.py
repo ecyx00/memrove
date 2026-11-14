@@ -62,7 +62,8 @@ class DeliveryP1Test(unittest.TestCase):
         used = sum(len(v.encode()) for k, v in slots.items() if k != "rules")
         self.assertGreater(len(slots["rules"].encode()), 2500)   # rules take the room the other slots leave
         self.assertGreater(len(slots["rules"].encode()), 4000 - used - 300)
-        self.assertIn("Standing rules no longer fit", slots["status"])   # 60 rules overflow: the agent is told
+        self.assertIn("Standing rules no longer fit", slots["owner"])   # 60 rules overflow: the owner is told (systemMessage)
+        self.assertNotIn("Standing rules no longer fit", text)   # upkeep stays out of the model's context
         self.assertLessEqual(len(slots["card"].encode()), 600)
         self.assertIn("handoff card c-1", slots["card"])
         self.assertIn("memrove card --did", slots["card"])   # the handoff line survives the card's cut

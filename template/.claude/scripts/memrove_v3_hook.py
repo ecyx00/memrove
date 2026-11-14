@@ -31,6 +31,14 @@ def prompt_text(payload):
     return prompt if isinstance(prompt, str) else ""
 
 
+SIDE_NOTE = re.compile(r"\AHere is a note offered by a side agent:[ \t]*(?:\n[ \t]*(?:>[^\n]*)?)*")
+
+
+def owner_words(text):
+    """The prompt without a leading side-agent note (Claude Code's "You should know" feature puts it into the user turn); '' when nothing else is left."""
+    return SIDE_NOTE.sub("", text.lstrip(), count=1).strip() if text else text
+
+
 def is_synthetic_prompt(payload):
     """True for turns no human typed (subagent results, peer messages, task notifications)."""
     if not isinstance(payload, dict) or os.environ.get("MEMROVE_V3_FILTER_HARNESS_TURNS") == "0":
@@ -121,7 +129,7 @@ def pastref_line(payload, state=None):
         if os.environ.get("MEMROVE_PASTREF") == "0" or is_synthetic_prompt(payload):
             return ""
         from memrove_v3_pastref import line
-        text = line(prompt_text(payload))
+        text = line(owner_words(prompt_text(payload)))
         if not text:
             return ""
         if state:
@@ -443,7 +451,7 @@ def recent_words(path, budget, each=TAIL_MSG):
     for ln in reversed(lines):
         try:
             rec = json.loads(ln)
-            text = user_text(rec)
+            text = owner_words(user_text(rec))
         except ValueError:
             continue
         origin = rec.get("origin")
@@ -472,7 +480,10 @@ def session_start(state, payload, vault, harness="claude"):
 
     def status():
         from memrove_v3_heartbeat import line
-        text = line(state) + health_warning(state) + claude_md_warning()
+        return line(state) + health_warning(state)
+
+    def upkeep():   # chores for the owner: shown to the person as a systemMessage, kept out of the model's context
+        text = claude_md_warning()
         try:
             from memrove_v3_checks import notice as stale_notice
             text += stale_notice(state)
@@ -511,20 +522,35 @@ def session_start(state, payload, vault, harness="claude"):
 
     slot("status", status, b["status"])
     slot("usage", usage, b["usage"])
+    try:
+        owner = upkeep()
+    except Exception:
+        owner = ""
     if harness == "claude":   # rules are binding: they get every byte the other start slots leave, never less than their own budget
         slots["rules"] = ""
         slot("card", card, b["card"])
         warn = "Standing rules no longer fit the start block: merge or retire some (memrove rules --left-out).\n"
-        room = max(b["rules"], b["total"] - b["words"] - len(warn.encode()) - sum(len(v.encode()) for v in slots.values()))
+        room = max(b["rules"], b["total"] - b["words"] - sum(len(v.encode()) for v in slots.values()))
         slot("rules", lambda: rules(room), room)
         if "left out by the size cap" in slots["rules"]:
-            slots["status"] = slots.get("status", "") + warn
+            owner += warn
     if src == "compact" and payload.get("transcript_path"):
         slot("words", lambda: recent_words(payload["transcript_path"], b["words"]), b["words"])
     if src == "compact":   # heads are pull-able (memrove search); only a compaction loses context they help restore
         from memrove_v3_heads import start_view
         slot("heads", lambda: start_view(state, payload.get("cwd") or ".", cap=b["total"]), b["total"] - sum(len(v.encode()) for v in slots.values()))
-    return fit("".join(slots.values()), b["total"]), slots
+    text = fit("".join(slots.values()), b["total"])
+    if owner:
+        slots["owner"] = owner
+    return text, slots
+
+
+def start_output(event, notice, slots):
+    """Hook JSON: the model's text as additionalContext, the owner's upkeep line as a systemMessage the person sees."""
+    out = output_context(event, notice) if notice else {}
+    if slots and slots.get("owner"):
+        out["systemMessage"] = "memrove: " + " ".join(slots["owner"].split("\n")).strip()
+    return json.dumps(out) if out else "{}"
 
 
 def emit(state, event, payload, out, slots=None):
@@ -598,14 +624,14 @@ def main():
             elif event == "UserPromptSubmit":
                 notice = pastref_line(payload, state)
         if read_only:
-            emit(state, event, payload, json.dumps(output_context(event, notice)) if notice else "{}", slots)
+            emit(state, event, payload, start_output(event, notice, slots), slots)
             return
         settings = read(vault)
         if settings["auto_sync"]:  # manual profile: no queueing, no worker
             enqueue_event(vault, state, payload, args.harness)
             if os.environ.get("MEMROVE_V3_NO_SPAWN") != "1" and (event in ("PreCompact", "SessionEnd") or claim_check(state, settings, event)):
                 spawn_worker(vault, state, args.harness)
-        emit(state, event, payload, json.dumps(output_context(event, notice)) if notice else "{}", slots)
+        emit(state, event, payload, start_output(event, notice, slots), slots)
     except Exception as exc:
         note_error(state, exc)
         if not args.metadata_only and event in ("SessionStart", "UserPromptSubmit"):

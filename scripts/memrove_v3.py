@@ -83,6 +83,9 @@ COMMANDS = {
     "date": ("Chat memory: the date and time of message id", [opt("id", type=msg_id)]),
     "doc": ("Print a docs write-up (or one section) that a search handle points to; indexed doc roots only", [
         opt("path"), opt("--section", help="heading of the section to print; default the whole file")]),
+    "brief": ("Reading list of one topic: its design/research/state docs (paths and decisions, no bodies) and live decision records", [
+        opt("topic"), opt("--project", help="default: project of the current directory"), opt("--max", type=int, default=30, help="docs at most"),
+        opt("--cwd", default=".")]),
     "rebrief": ("Metric: owner prompts that ask for the same thing again in another session", [
         opt("--out", default="/tmp/e71-out/rebrief-pairs.jsonl"), opt("--min-score", type=float, default=0.5),
         opt("--since", help="only prompts from YYYY-MM-DD on")]),
@@ -320,6 +323,13 @@ def cmd_grab(args, ctx):
         return remember(ctx.engine(), "note", text, why, "_general", False, current_session(Path.cwd()))
 
     return grab.main(args.rest, vault=ctx.vault, state=ctx.state, note=note)
+
+
+def cmd_brief(args, ctx):
+    import memrove_v3_docsearch as ds
+    cwd = Path(args.cwd).expanduser().resolve()
+    print(ds.brief(ctx.state, args.topic, cwd, args.project or project_name(cwd, ctx.state), args.max))
+    return 0
 
 
 def cmd_project(args, ctx):
@@ -715,7 +725,7 @@ def cmd_pack(args, ctx):
 
 
 HANDLERS = {"init": cmd_init, "sync": cmd_sync, "wake": cmd_chat, "zoom": cmd_chat, "date": cmd_chat, "chatlog": cmd_chat,
-            "rebrief": cmd_rebrief, "incidents-backfill": cmd_incidents_backfill, "doc": cmd_doc, "grab": cmd_grab, "project": cmd_project, "graph": cmd_graph,
+            "rebrief": cmd_rebrief, "incidents-backfill": cmd_incidents_backfill, "doc": cmd_doc, "brief": cmd_brief, "grab": cmd_grab, "project": cmd_project, "graph": cmd_graph,
             "wiki": cmd_wiki, "backup": cmd_backup, "restore": cmd_restore, "preferences": cmd_preferences,
             "recall-stats": cmd_recall_stats, "doctor": cmd_doctor, "companion-compact": cmd_compact,
             "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "reflect": cmd_reflect, "show": cmd_show, "bridge": cmd_bridge,
