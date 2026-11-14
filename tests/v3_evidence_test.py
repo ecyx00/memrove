@@ -37,6 +37,13 @@ class EvidenceTest(unittest.TestCase):
         r = {"kind": "decision", "text": 'The owner said "always use sqlite for the store and avoid postgres".'}
         self.assertEqual(evidence.verify(self.state, r), [])
 
+    def test_owner_quote_gate_matches_user_messages_only(self):
+        chatlog.append(self.state, [{"kind": "agent", "text": "the assistant alone wrote this sentence here", "date": "2026-10-07T10:01:00+00:00", "src": "claude", "k": "c:msg-2"}])
+        self.assertEqual(evidence.owner_quote(self.state, SAID.upper(), None), SAID.upper())
+        self.assertEqual(evidence.owner_quote(self.state, None, f"Owner: '{SAID}'"), SAID)
+        self.assertIsNone(evidence.owner_quote(self.state, "the assistant alone wrote this sentence here", None))
+        self.assertIsNone(evidence.owner_quote(self.state, None, None))
+
     def test_agent_record_never_reaches_the_standing_rules_even_when_verified(self):
         def restated(rid, sentence):
             self.c._patch(rid, "test", assessments={"restate": {"state": "assessed", "answers": {"standing_rule": "yes", "scope": "global", "sentence": sentence}}})

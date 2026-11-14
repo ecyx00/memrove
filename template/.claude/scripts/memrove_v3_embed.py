@@ -397,17 +397,19 @@ def owner_messages(state):
 
 
 def _search_only(state, have):
-    """[(id, record)] of the preference and note records `memrove search` ranks that the push hook never reads (recall.KINDS lacks them),
-    so the search dense lane sees them. Only the EG2 store gets them: the hook rescoring takes candidates from the static list."""
+    """[(id, record)] of the not retired records `memrove search` ranks that the push hook never reads: the preference and note kinds
+    (recall.KINDS lacks them) and any record recall._load drops but search keeps (_load retires a record whenever ANY record supersedes it,
+    a dropped_llm one included; search only counts live superseders). Only the EG2 store gets them: the hook rescoring takes candidates from the static list."""
     import json as _json
     import sqlite3
-    from memrove_v3_chatsearch import REC_SOURCES
+    from memrove_v3_chatsearch import REC_KINDS, REC_OFF, REC_SOURCES
     skip = {rid for rid, _ in have}
     db = sqlite3.connect(f"file:{Path(state) / 'memory.sqlite3'}?mode=ro", uri=True, timeout=30)
     try:
-        rows = db.execute("SELECT id, payload FROM records WHERE json_extract(payload,'$.kind') IN ('preference','note') AND ("
+        rows = db.execute(f"SELECT id, payload FROM records WHERE json_extract(payload,'$.kind') IN ({','.join('?' * len(REC_KINDS))}) "
+                          f"AND coalesce(json_extract(payload,'$.status'),'') NOT IN ({','.join('?' * len(REC_OFF))}) AND ("
                           + " OR ".join("coalesce(json_extract(payload,'$.source'),'') LIKE ?" for _ in REC_SOURCES) + ")",
-                          [x + "%" for x in REC_SOURCES]).fetchall()
+                          [*REC_KINDS, *sorted(REC_OFF), *(x + "%" for x in REC_SOURCES)]).fetchall()
     finally:
         db.close()
     return [(rid, _json.loads(p)) for rid, p in rows if rid not in skip]

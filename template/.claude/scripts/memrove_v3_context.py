@@ -160,7 +160,7 @@ def _retry_locked(sync, fn, budget=120.0):
             pass
 
 
-def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None, valid_from=None, agent=None, close=True, provenance=None):
+def remember(sync, kind, text, why=None, project=None, user=False, session=None, source="memrove-cli", supersedes=(), topic=None, check=None, measured=None, valid_from=None, agent=None, close=True, provenance=None, quote=None):
     """Model-written memory: same observe contract (validate, commit, readback), core kinds allowed. Idempotent on (kind, text)."""
     from memrove_v3_capture import has_secret, key_of
     if kind not in REMEMBER_KINDS:
@@ -176,6 +176,8 @@ def remember(sync, kind, text, why=None, project=None, user=False, session=None,
                "valid_from": valid_from or datetime.now(timezone.utc).date().isoformat(), "key": key_of(text)}
     if user:
         payload["verified_by"] = "user_quote"
+        if quote:  # the owner's exact words (code-checked by the CLI gate); evidence.quotes() verifies the record from it
+            payload["quote"] = " ".join(quote.split())
     if why:
         payload["why"] = " ".join(why.split())
     if project:

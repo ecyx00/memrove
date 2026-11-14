@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Hybrid search routing: the Turkish detector, and flag off / English query = the plain bm25 path."""
+import json
 import os
+import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -38,6 +41,17 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(sum(r[0].startswith("rec:") for r in out), C.HYBRID_REC_SLOTS)
         self.assertEqual(len(out), 10)
         self.assertTrue(any(not r[0].startswith("rec:") for r in out))
+
+    def test_record_superseded_by_a_dropped_one_gets_a_vector(self):
+        import memrove_v3_embed as E
+        rec = lambda **k: json.dumps({"kind": "lesson", "text": "t", "source": "notes/observed/lesson/x.md", **k})
+        with tempfile.TemporaryDirectory() as d:
+            db = sqlite3.connect(Path(d) / "memory.sqlite3")
+            db.execute("CREATE TABLE records(id TEXT PRIMARY KEY, payload TEXT)")
+            db.executemany("INSERT INTO records VALUES(?,?)", [("old", rec(status="active")), ("new", rec(status="dropped_llm", supersedes=["old"])), ("gone", rec(status="retired"))])
+            db.commit()
+            db.close()
+            self.assertEqual([i for i, _ in E._search_only(d, [])], ["old"])   # not the dropped or retired one
 
 
 if __name__ == '__main__':

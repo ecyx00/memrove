@@ -179,7 +179,8 @@ COMMANDS = {
     "remember": ("Save one decision, rejected option, lesson, preference or note; prints the id", [
         opt("text"), opt("--kind", required=True, choices=RECORD_KINDS), opt("--why"),
         opt("--project", help="default: project root name of --cwd"),
-        opt("--user", action="store_true", help="the text quotes the user verbatim (origin user_explicit)"),
+        opt("--user", action="store_true", help="the owner said this (origin user_explicit); needs --quote, checked against the user messages of the chat log"),
+        opt("--quote", help="with --user: the owner's exact words (16+ chars) as written in their message, in their own language; refused when no user message holds them"),
         opt("--session", help="default: CLAUDE_CODE_SESSION_ID, else the newest transcript of --cwd"),
         opt("--supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; repeatable"),
         opt("--from", dest="from_msg", type=int, help="chat-log message id the idea came from; needs --span"),
@@ -603,7 +604,13 @@ def cmd_remember(args, ctx):
     if args.trigger or args.trigger_tool:  # validate before anything is saved
         import memrove_v3_triggers
         trigger = memrove_v3_triggers.spec(args.trigger_tool, args.trigger, args.trigger_cwd, args.trigger_deny)
-    item = {"kind": args.kind, "text": args.text, "why": args.why, "project": project, "user": args.user, "source": "memrove-cli",
+    quote = None
+    if args.user:  # an agent's --user claim is trusted only when the owner's words are in the chat log
+        import memrove_v3_evidence as evidence
+        quote = evidence.owner_quote(ctx.state, args.quote, args.why)
+        if not quote:
+            raise ValueError("the owner's words were not found in a user message of the chat log; copy 16+ characters of the owner's own message, in their language, into --quote \"<exact words>\" and run again; do not drop --user for the owner's correction, because a record without it never becomes a standing rule")
+    item = {"kind": args.kind, "text": args.text, "why": args.why, "project": project, "user": args.user, "quote": quote, "source": "memrove-cli",
             "supersedes": args.supersedes, "topic": args.topic, "check": args.check, "measured": args.scope}
     sess = args.session or current_session(cwd)
     import memrove_v3_prov as prov

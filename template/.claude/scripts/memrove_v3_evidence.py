@@ -1,8 +1,8 @@
 """Evidence-first memory (vision point 5): a record is `verified` only when CODE finds its quote verbatim in a chat-log message.
 No model judges this (Reflect v2: Haiku agreed with itself 43% of the time, and most records come from tool output that is not in the log).
 
-quote candidates   ctx (the message part of a user quote's ctx), a "double-quoted" span of the text, and, for a user quote
-                   (verified_by=user_quote), its text: that text IS the quote.
+quote candidates   ctx (the message part of a user quote's ctx), a "double-quoted" span of the text, the record's `quote` (the owner's
+                   exact words an agent passed with --user; user-only) and, for a user quote (verified_by=user_quote), its text.
 match              whitespace collapsed + casefold, substring of one message, at least MIN characters (shorter strings match everywhere).
                    A user-quote candidate may only match a user message, so an agent echo never verifies an owner quote.
 result             verify() -> [{"kind": "msg", "ref": <message k>}] (up to REFS, user messages first), [] = unverified.
@@ -18,6 +18,7 @@ import memrove_v3_chatlog as chatlog
 
 MIN, REFS = 16, 3
 SPAN = re.compile(r'"([^"\n]+)"|“([^”\n]+)”|«([^»\n]+)»')
+WHY_SPAN = re.compile(SPAN.pattern + r"|'([^'\n]{16,})'|‘([^’\n]{16,})’")  # agents write why="Owner: '<words>'"
 CTX_MSG = re.compile(r"\bmessage: (.*?)(?: \| (?:owner|assistant): |$)", re.S)
 SEP = "\0"
 
@@ -66,8 +67,17 @@ def quotes(r):
         out.append((m.group(1), True))
     if own:
         out.append((r.get("text", ""), True))
+    if r.get("quote"):
+        out.append((r["quote"], True))
     out += [(next(g for g in s if g), False) for s in SPAN.findall(r.get("text", ""))]
     return [(norm(q), u) for q, u in out if len(norm(q)) >= MIN]
+
+
+def owner_quote(state, quote, why):
+    """The --user gate: the first candidate (the --quote value, then each quoted span of --why) found verbatim in a user message, else None."""
+    cands = [quote or ""] + [next(g for g in m if g) for m in WHY_SPAN.findall(why or "")]
+    log = load(state)
+    return next((c for c in cands if len(norm(c)) >= MIN and Log.find(log.user, norm(c))), None)
 
 
 def verify(state, record, log=None):
