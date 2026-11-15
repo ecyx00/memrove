@@ -8,8 +8,15 @@ KINDS = ("decision", "rejected", "preference")  # kinds that take part in supers
 GONE = ("retired", "rejected", "dropped_llm", "deleted_by_user", "source_missing", "superseded")
 
 
-def nudge(state, project, text, exclude=None, n=3):
-    """Up to n 'may replace: rec:…' lines; [] when nothing shares enough terms or on any error."""
+def overlap(mine, theirs):
+    """Shared share of the smaller term set when the nudge rule fires (3 or more shared terms, ratio 0.4), else 0."""
+    small = min(len(mine), len(theirs))
+    shared = len(mine & theirs)
+    return shared / small if shared >= 3 and shared >= 0.4 * small else 0
+
+
+def neighbours(state, project, text, exclude=None, n=3):
+    """Up to n [(id, day, snippet)] open same-project records close to text; [] when nothing shares enough terms or on any error."""
     try:
         from memrove_v3_recall import terms
         path = Path(state) / "memory.sqlite3"
@@ -25,13 +32,19 @@ def nudge(state, project, text, exclude=None, n=3):
             theirs = set(terms(p.get("text") or ""))
             if p["id"] == exclude or p["id"] in gone or p.get("status") in GONE or not theirs:
                 continue
-            shared = len(mine & theirs)
-            if shared >= 3 and shared >= 0.4 * min(len(mine), len(theirs)):
+            ratio = overlap(mine, theirs)
+            if ratio:
                 day = str(p.get("valid_from") or p.get("recorded_at") or "")[:10]
-                scored.append((-shared / min(len(mine), len(theirs)), day, p["id"], " ".join(str(p["text"]).split())[:70]))
-        return [f"may replace: rec:{i} ({d} {t}) (rerun with --supersedes {i})" for _, d, i, t in sorted(scored)[:n]]
+                scored.append((-ratio, day, p["id"], " ".join(str(p["text"]).split())[:70]))
+        return [(i, d, t) for _, d, i, t in sorted(scored)[:n]]
     except Exception:
         return []
+
+
+def line(neighbour, new):
+    """One 'may replace' line with the memrove settle command that answers it."""
+    i, d, t = neighbour
+    return f"may replace: rec:{i} ({d} {t}) (answer: memrove settle {new} {i} --replaces | --rests-on --why-link \"<why>\" | --unrelated)"
 
 
 def topic_line(state, project, n=8):

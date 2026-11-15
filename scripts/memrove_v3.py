@@ -182,7 +182,9 @@ COMMANDS = {
         opt("--user", action="store_true", help="the owner said this (origin user_explicit); needs --quote, checked against the user messages of the chat log"),
         opt("--quote", help="with --user: the owner's exact words (16+ chars) as written in their message, in their own language; refused when no user message holds them"),
         opt("--session", help="default: CLAUDE_CODE_SESSION_ID, else the newest transcript of --cwd"),
-        opt("--supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; repeatable"),
+        opt("--replaces", "--supersedes", dest="supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; repeatable"),
+        opt("--rests-on", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one builds on; repeatable, each needs a --why-link in the same order"),
+        opt("--why-link", action="append", default=[], metavar="SENTENCE", help="why the matching --rests-on record is linked (not --why, which is the record's own reason)"),
         opt("--from", dest="from_msg", type=int, help="chat-log message id the idea came from; needs --span"),
         opt("--span", help="5+ words copied verbatim from that message; checked by code, a fake one refuses the save"),
         opt("--check", help="read-only shell line that exits 0 while the record is true (allowlisted, 5 s); dry-run now, refused if it fails"),
@@ -193,6 +195,9 @@ COMMANDS = {
         opt("--trigger-cwd", help="regex the working directory must also match"),
         opt("--trigger-deny", action="store_true", help="refuse the tool call instead of warning"),
         opt("--cwd", default=".")]),
+    "settle": ("Answer a neighbour a save showed: settle <new-id> <neighbour-id> --replaces | --rests-on --why-link \"<why>\" | --unrelated | --undo (takes a replace or rests-on back)", [
+        opt("new"), opt("neighbour"), opt("--replaces", action="store_true"), opt("--rests-on", action="store_true"),
+        opt("--why-link", help="why the new record rests on the neighbour (one sentence)"), opt("--unrelated", action="store_true"), opt("--undo", action="store_true")]),
     "trigger": ("Make a record fire in the PreToolUse hook: trigger <id> --tool T --match RX (RX runs on tool_input.command if a string, else the JSON tool_input) [--cwd RX] [--deny]; trigger --list; trigger <id> --clear", [
         opt("id", nargs="?"), opt("--tool", action="append", default=[]), opt("--match"), opt("--cwd"),
         opt("--deny", action="store_true"), opt("--clear", action="store_true"), opt("--list", action="store_true")]),
@@ -610,6 +615,15 @@ def cmd_remember(args, ctx):
         quote = evidence.owner_quote(ctx.state, args.quote, args.why)
         if not quote:
             raise ValueError("the owner's words were not found in a user message of the chat log; copy 16+ characters of the owner's own message, in their language, into --quote \"<exact words>\" and run again; do not drop --user for the owner's correction, because a record without it never becomes a standing rule")
+    import memrove_v3_suspense as suspense
+    engine = ctx.engine()
+    if len(args.rests_on) != len(args.why_link) or not all(w.strip() for w in args.why_link):
+        raise ValueError("each --rests-on needs its own non-empty --why-link, in the same order")
+    replaced, rests = [], []
+    if args.supersedes or args.rests_on:
+        with engine.store._connect() as db:   # validate before anything is saved
+            replaced = [suspense.resolve(db, i) for i in args.supersedes]
+            rests = [(suspense.resolve(db, i), " ".join(w.split())) for i, w in zip(args.rests_on, args.why_link)]
     item = {"kind": args.kind, "text": args.text, "why": args.why, "project": project, "user": args.user, "quote": quote, "source": "memrove-cli",
             "supersedes": args.supersedes, "topic": args.topic, "check": args.check, "measured": args.scope}
     sess = args.session or current_session(cwd)
@@ -623,6 +637,11 @@ def cmd_remember(args, ctx):
     if result["status"] == "exists":
         print(result["id"] + " (exists)", file=sys.stderr)
     print(result["id"])
+    if replaced or rests:   # also for a record that already exists; the record is saved; a failed link is reported, never a lost save
+        try:
+            suspense.answer(engine, result["id"], replaced, rests, sess)
+        except Exception as exc:
+            print(f"link not written ({type(exc).__name__}): answer with memrove settle {result['id']} <id> --replaces | --rests-on --why-link \"<why>\"", file=sys.stderr)
     if trigger:
         memrove_v3_triggers.set_trigger(ctx.vault, ctx.state, result["id"], trigger)
     if result["status"] != "exists":
@@ -634,13 +653,9 @@ def cmd_remember(args, ctx):
             pass
     if getattr(args, "visible", None):   # the nudge and topic lines quote other records and write-ups unfiltered: only a local reader gets them
         return 0
-    if result["status"] != "exists" and not args.supersedes and args.kind != "note":
-        try:
-            from memrove_v3_nudge import nudge
-            for line in nudge(ctx.state, project, args.text, exclude=result["id"]):
-                print(line, file=sys.stderr)
-        except Exception:  # the nudge is a courtesy; the record is already saved
-            pass
+    if result["status"] != "exists" and args.kind != "note":   # offer() never raises: the record is already saved
+        for line in suspense.offer(engine, ctx.state, project, args.text, result["id"], sess, {*replaced, *(i for i, _ in rests)}):
+            print(line, file=sys.stderr)
     for p in result.get("proposals") or []:  # relate_new (MEMROVE_RELATE=1): older records this one may replace
         print(f"relate proposal: {p['src']} may replace {p['dst']}: {p['why']}", file=sys.stderr)
     if args.kind in ("decision", "rejected"):
@@ -717,6 +732,20 @@ def cmd_card(args, ctx):
             "valid_from": date.today().isoformat(), "did": args.did, "why": args.why, "open": args.open, "next": args.next}
     card.upsert(engine, cid, meta, card._sources(engine, sid))
     print(cid)
+    import memrove_v3_suspense as suspense
+    if line := suspense.card_line(engine, meta["project"], sid):   # counts and ids only
+        print(line)
+    return 0
+
+
+def cmd_settle(args, ctx):
+    import memrove_v3_suspense as suspense
+    modes = [m for m, on in (("replaces", args.replaces), ("rests_on", args.rests_on), ("unrelated", args.unrelated), ("undo", args.undo)) if on]
+    if len(modes) != 1:
+        raise ValueError("pass exactly one of --replaces, --rests-on, --unrelated, --undo")
+    if modes[0] == "rests_on" and not (args.why_link or "").strip():
+        raise ValueError("--rests-on needs --why-link")
+    print(suspense.settle(ctx.engine(), args.new, args.neighbour, modes[0], " ".join((args.why_link or "").split())))
     return 0
 
 
@@ -736,7 +765,7 @@ HANDLERS = {"init": cmd_init, "sync": cmd_sync, "wake": cmd_chat, "zoom": cmd_ch
             "wiki": cmd_wiki, "backup": cmd_backup, "restore": cmd_restore, "preferences": cmd_preferences,
             "recall-stats": cmd_recall_stats, "doctor": cmd_doctor, "companion-compact": cmd_compact,
             "backfill": cmd_backfill, "import-sessions": cmd_import_sessions, "import-chats": cmd_import_chats, "search": cmd_search, "reflect": cmd_reflect, "show": cmd_show, "bridge": cmd_bridge,
-            "remember": cmd_remember, "rules": cmd_rules, "rule-scope": cmd_rule_scope, "trigger": cmd_trigger, "card": cmd_card, "pack": cmd_pack}
+            "remember": cmd_remember, "settle": cmd_settle, "rules": cmd_rules, "rule-scope": cmd_rule_scope, "trigger": cmd_trigger, "card": cmd_card, "pack": cmd_pack}
 
 
 def resolve_paths(args):

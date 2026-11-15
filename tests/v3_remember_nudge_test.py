@@ -33,14 +33,15 @@ class RememberNudge(unittest.TestCase):
             self.assertNotIn("bike shed", second.stderr)
             self.assertTrue(second.stdout.strip().startswith("obs-"))
             replaced = run("Switch ingestion to the zebrafish queue v3", "--kind", "decision", "--supersedes", first.stdout.strip())
-            self.assertNotIn("may replace", replaced.stderr)  # explicit supersedes: no nudge
+            self.assertNotIn("rec:" + first.stdout.strip(), replaced.stderr)  # the answered neighbour is not shown again
+            self.assertIn("may replace: rec:" + second.stdout.strip(), replaced.stderr)  # v2 is unanswered: still shown
 
     def test_never_raises(self):
-        from memrove_v3_nudge import nudge
+        from memrove_v3_nudge import neighbours
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "memory.sqlite3").write_bytes(b"not a database")
-            self.assertEqual(nudge(tmp, "p", "use zebrafish queue"), [])
-            self.assertEqual(nudge(tmp + "/missing", "p", "use zebrafish queue"), [])
+            self.assertEqual(neighbours(tmp, "p", "use zebrafish queue"), [])
+            self.assertEqual(neighbours(tmp + "/missing", "p", "use zebrafish queue"), [])
 
 
 if __name__ == "__main__":
