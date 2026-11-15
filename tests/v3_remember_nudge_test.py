@@ -24,17 +24,17 @@ class RememberNudge(unittest.TestCase):
                                             env=env, capture_output=True, text=True)
             first = run("Use zebrafish queue for ingestion", "--kind", "decision")
             self.assertEqual(first.returncode, 0, first.stderr)
-            self.assertNotIn("may replace", first.stderr)
+            self.assertNotIn("neighbour rec:", first.stderr)
             unrelated = run("Paint the bike shed green", "--kind", "decision")
-            self.assertNotIn("may replace", unrelated.stderr)
+            self.assertNotIn("neighbour rec:", unrelated.stderr)
             second = run("Switch ingestion to the zebrafish queue v2", "--kind", "decision")
             self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertIn("may replace: rec:" + first.stdout.strip(), second.stderr)
+            self.assertIn("neighbour rec:" + first.stdout.strip(), second.stderr)
             self.assertNotIn("bike shed", second.stderr)
             self.assertTrue(second.stdout.strip().startswith("obs-"))
             replaced = run("Switch ingestion to the zebrafish queue v3", "--kind", "decision", "--supersedes", first.stdout.strip())
             self.assertNotIn("rec:" + first.stdout.strip(), replaced.stderr)  # the answered neighbour is not shown again
-            self.assertIn("may replace: rec:" + second.stdout.strip(), replaced.stderr)  # v2 is unanswered: still shown
+            self.assertIn("neighbour rec:" + second.stdout.strip(), replaced.stderr)  # v2 is unanswered: still shown
 
     def test_never_raises(self):
         from memrove_v3_nudge import neighbours

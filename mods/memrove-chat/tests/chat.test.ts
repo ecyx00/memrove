@@ -39,6 +39,7 @@ describe('chat.ts', () => {
 
   test('shortenInstruction swaps the memrove text for one line, once', () => {
     expect(shortenInstruction(['a', 'Memrove chat memory is on: x', 'Memrove chat memory is on: y'])).toEqual(['a', ONE_LINE])
+    expect(shortenInstruction(['a', 'Memrove chat memory (usage note):\n- search: x'])).toEqual(['a', ONE_LINE])   // the header memrove_v3_chattree.INSTRUCTION has now
     expect(shortenInstruction(undefined)).toBeUndefined()
   })
 

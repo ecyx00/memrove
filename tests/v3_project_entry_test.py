@@ -55,8 +55,9 @@ class ProjectEntryTest(unittest.TestCase):
         cur, gone = out.split('[SUPERSEDED')[0], out
         self.assertRegex(out, r'rec:dec:new 2026-10-01 Use Postgres')
         self.assertNotRegex(out, r'rec:dec:new[^\n]*SUPERSEDED')
-        self.assertRegex(out, r'rec:dec:old[^\n]*SQLite[^\n]*\[SUPERSEDED by rec:dec:new\]')  # record field
-        self.assertRegex(out, r'rec:dec:edge-old[^\n]*\[SUPERSEDED by rec:dec:edge-new\]')  # stored graph edge
+        self.assertRegex(out, r'rec:dec:old REPLACED by rec:dec:new on \d{4}-[^\n]*do not use as current\. [^\n]*SQLite')  # record field
+        self.assertRegex(out, r'rec:dec:edge-old [^\n]*\[SUPERSEDED; proposal: rec:dec:edge-new may replace it\]')  # stored graph edge: a proposal, not the REPLACED line
+        self.assertNotIn('REPLACED by rec:dec:edge-new', out)
         self.assertNotIn('Beta only', out)
         self.assertLess(out.index('rec:dec:new'), out.index('rec:dec:old'))
         self.assertTrue(cur and gone)
@@ -75,7 +76,7 @@ class ProjectEntryTest(unittest.TestCase):
         from memrove_v3_context import remember
         r = remember(self.engine, 'decision', 'Resume the paused eval work.', project='alpha', user=True, supersedes=['rec:dec:edge-new'])
         out = self.text()
-        self.assertRegex(out, r'rec:dec:edge-new[^\n]*\[SUPERSEDED by rec:' + r['id'])
+        self.assertRegex(out, r'rec:dec:edge-new REPLACED by rec:' + r['id'])
         self.assertRegex(out, r'rec:' + r['id'] + r' [^\n]*Resume')
         with self.assertRaises(ValueError):
             remember(self.engine, 'decision', 'Other call.', project='alpha', supersedes=['nope-404'])

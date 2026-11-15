@@ -452,10 +452,19 @@ def project_record(engine, record):
     if not path.is_file():
         return record
     _hash, _atomic, _render = engine.projection_helpers()
+    raw = path.read_bytes()
+    if _hash(raw) != record.get('source_sha256'):  # a hand edit no sync has read yet: take it in first (as the next sync would), so the write below keeps it
+        from memrove_v3_sync import parse
+        try:
+            record = engine._overrides(record, *parse(raw.decode('utf-8')))
+        except ValueError:
+            pass
     body = record['text']
     if record.get('user_note'):
         body = body.rstrip('\n') + '\n\n' + USER_NOTE_MARK + '\n' + record['user_note'] + '\n'
     text = _render({k: v for k, v in record.items() if k not in _NOT_FRONTMATTER and v is not None and not (k == 'facts' and not v)}, body)
+    if (journal := getattr(engine, "rollback_journal", None)) is not None:  # shortcut: a non-UTF-8 note comes back with U+FFFD; inside a suspense transaction: a kill before its commit puts this note back (SyncEngine.resolve_rollbacks)
+        journal.add(path, src, raw.decode('utf-8', 'replace'), _hash(text))
     _atomic(path, text)
     return dict(record, source_sha256=_hash(text))
 

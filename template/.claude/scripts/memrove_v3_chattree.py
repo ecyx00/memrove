@@ -898,12 +898,13 @@ def date_of(state, i):
     return datetime.fromisoformat(r["date"]).strftime("%Y-%m-%d %H:%M:%S %z")
 
 
-INSTRUCTION = """Memrove chat memory is on: all past sessions (usage note):
-- search: `memrove search "<words>"` finds messages and saved records; `memrove show <id>` opens a record
+INSTRUCTION = """Memrove chat memory (usage note):
+- search: `memrove search "<words>"` finds messages and records; `memrove show <id>` opens one
 - wake: `memrove wake [n]` prints the map, lines `id+n|summary`
 - zoom: `memrove zoom <id> <n>` opens a line into its messages
-- verify drift-prone facts before relying on them; a hit is a lead, not evidence
-- the owner's words beat an agent's; newer beats older"""
+- verify drift-prone facts before use; a hit is a lead, not evidence
+- the owner's words beat an agent's; newer beats older
+- REPLACED is history; a newer record or the code beats it; name the conflict"""
 
 
 def instruction(state):

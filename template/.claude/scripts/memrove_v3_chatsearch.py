@@ -450,6 +450,7 @@ def search(state, query, top=TOP, rerank=None, since=None, until=None, history=F
     Entries a newer head replaced stay, after the unreplaced hits and tagged `[replaced by REF]` (history=True: no tag, no reordering)."""
     import memrove_v3_docsearch as docsearch   # imported here: docsearch imports this module
     import memrove_v3_heads as heads
+    import memrove_v3_neighbours as nb
     rows = merged(state, query, top, rerank, since, until)
     docs = docsearch.handles(state, query)
     hs, replaced = heads.heads(state) if query.strip() or not history else ([], {})   # built once: it re-parses every write-up
@@ -461,7 +462,10 @@ def search(state, query, top=TOP, rerank=None, since=None, until=None, history=F
     docs = [d for d in docs if not by(d)] + [f"{d} [replaced by {by(d)}]" for d in docs if by(d)]
     rows = [r for r in rows if r[0] not in gone] + [(i, d, f"{k} [replaced by {gone[i]}]", t) for i, d, k, t in rows if i in gone]
     head_lines = [f"head|{h['day']}|{h['topic']}{' ' + h['status'] if h['status'] else ''}|{h['ref']}|{snippet(h['decision'] + (' | next: ' + h['next'] if h['next'] else ''), query)}" for h in top_heads]
-    line = lambda r: f"{r[0]}|{(r[1] or '')[:16].replace('T', ' ')}|{r[2]}|{snippet(r[3], query)}"
+    def line(r):
+        row = f"{r[0]}|{(r[1] or '')[:16].replace('T', ' ')}|{r[2]}|{snippet(r[3], query)}"
+        boundary = nb.replaced(state, r[0]) if "[replaced by rec:" in r[2] else ""   # from the record's own `supersedes` field, never from a stored (model) edge
+        return f"{boundary}\n{row}" if boundary else row
     tail = ("\n\ndocs (open with memrove doc PATH [--section HEADING]; Read also works):\n" + "\n".join(docs)) if docs else ""
     if not (rows or top_heads):
         return "no message matches" + tail

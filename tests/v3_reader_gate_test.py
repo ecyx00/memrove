@@ -2,8 +2,10 @@
 """Fail-closed egress: an unknown label counts as device_only everywhere, and a CLI reader that is not Claude Code, Codex or a terminal
 (opencode, Gemini, a script) sees only the records its tier may see. Stub RUNNER only."""
 import importlib.util
+import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -90,10 +92,98 @@ class CliReaderTest(Base):
         self.assertNotIn("private rule", text)
         self.engine.note_create("notes/observed/acme.md", "private widget pricing tables stay secret forever", {"id": "obs-acme", "kind": "decision", "project": "acme", "egress": "device_only"})
         said = "widget pricing tables stay secret forever and ever"
-        self.assertIn("may replace: rec:obs-acme", self.run_cli("remember", said, "--kind", "decision", "--project", "acme", MEMROVE_READER="local").stderr)   # the nudge fires for the owner
+        self.assertIn("neighbour rec:obs-acme", self.run_cli("remember", said, "--kind", "decision", "--project", "acme", MEMROVE_READER="local").stderr)   # the nudge fires for the owner
         r = self.run_cli("remember", said + " again", "--kind", "decision", "--project", "acme")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("private widget", r.stdout + r.stderr)
+
+    def test_replaced_line_names_only_replacer_ids_the_reader_may_see(self):   # D12
+        import memrove_v3_neighbours as nb
+        from unittest import mock
+        mod = cli_module()
+        tail = "history, do not use as current."
+
+        def shown(line, visible):
+            with mock.patch.object(nb, "replaced", return_value=line), mock.patch("builtins.print") as out:
+                mod.cmd_show(mock.Mock(id="obs-open", visible=visible), mod.Context(self.vault, self.state))
+            return [c.args[0] for c in out.call_args_list if str(c.args[0]).startswith("REPLACED")]
+        free = mod._record_check(self.state, "free")   # obs-open is visible, obs-closed is not
+        self.assertEqual(shown(f"REPLACED by obs-closed, obs-open on 2026-11-15: {tail}", free), [f"REPLACED by obs-open on 2026-11-15: {tail}"])
+        self.assertEqual(shown(f"REPLACED by obs-closed on 2026-11-15: {tail}", free), [f"REPLACED on 2026-11-15: {tail}"])
+        self.assertEqual(shown(f"REPLACED by obs-closed on 2026-11-15: {tail}", None), [f"REPLACED by obs-closed on 2026-11-15: {tail}"])   # the owner's harness sees the id
+        search = (f"REPLACED by obs-closed on 2026-11-15: {tail}\nrec:obs-open|2026-11-03|decision|open rule\n"
+                  f"REPLACED by obs-open on 2026-11-15: {tail}\nrec:obs-closed|2026-11-03|decision|private rule")   # a boundary goes with its row, only when the row stays
+        self.assertEqual(mod._reader_lines(search, free).splitlines(), [f"REPLACED on 2026-11-15: {tail}", "rec:obs-open|2026-11-03|decision|open rule"])
+
+    def test_a_hidden_replacer_id_is_in_no_show_field_and_no_search_row_tag(self):   # M2
+        self.engine.note_create("notes/observed/new.md", "newer open rule about widgets", {"id": "obs-new", "kind": "decision", "egress": "external_ok"})
+        with sqlite3.connect(self.state / "memory.sqlite3") as db:   # obs-open is replaced by obs-closed (hidden from this reader) and by obs-new
+            db.execute("UPDATE records SET payload=json_set(payload,'$.supersedes',json_array('obs-open')) WHERE id IN ('obs-closed','obs-new')")
+        free, owner = self.run_cli("show", "obs-open"), self.run_cli("show", "obs-open", MEMROVE_READER="local")
+        self.assertEqual(free.returncode, 0, free.stderr)
+        self.assertNotIn("obs-closed", free.stdout + free.stderr)
+        self.assertEqual(json.loads(free.stdout[free.stdout.index("{"):])["superseded_by"], ["obs-new"])   # visible ids stay
+        self.assertEqual(json.loads(owner.stdout[owner.stdout.index("{"):])["superseded_by"], ["obs-closed", "obs-new"])   # the owner's harness sees both
+        mod = cli_module()
+        row = "rec:obs-open|2026-11-03|decision [replaced by rec:obs-closed]|open rule"
+        self.assertEqual(mod._reader_lines(row, mod._record_check(self.state, "free")), "rec:obs-open|2026-11-03|decision [replaced]|open rule")
+        self.assertEqual(mod._reader_lines(row.replace("obs-closed", "obs-new"), mod._record_check(self.state, "free")), row.replace("obs-closed", "obs-new"))
+
+    def _replaced_by_hidden(self):
+        """obs-open (visible) is replaced by obs-closed (hidden from a free reader)."""
+        with sqlite3.connect(self.state / "memory.sqlite3") as db:
+            db.execute("UPDATE records SET payload=json_set(payload,'$.supersedes',json_array('obs-open')) WHERE id='obs-closed'")
+
+    def test_n1_every_replaced_tag_of_a_search_row_loses_a_hidden_id(self):
+        from unittest import mock
+        import io
+        import memrove_v3_chatsearch as chat
+        mod = cli_module()
+        self.engine.note_create("notes/observed/new.md", "newer open rule about widgets", {"id": "obs-new", "kind": "decision", "egress": "external_ok"})
+        row = "rec:obs-open|2026-11-03|decision [replaced by rec:obs-new] [replaced by rec:obs-closed]|open rule"   # a topic head and a graph edge both replace it
+        for env, expect in (("free", "rec:obs-open|2026-11-03|decision [replaced by rec:obs-new] [replaced]|open rule"), ("local", row)):
+            out = io.StringIO()
+            args = mock.Mock(query="open", limit=None, since=None, until=None, history=False, json=False, records=False, visible=mod._record_check(self.state, "free") if env == "free" else None)
+            with mock.patch.object(chat, "search", return_value=row), mock.patch("sys.stdout", out), mock.patch("sys.stderr", out):
+                mod.cmd_search(args, mod.Context(self.vault, self.state))
+            self.assertEqual(out.getvalue().strip(), expect)
+
+    def test_n2_card_names_no_hidden_id_of_an_open_pair(self):
+        import memrove_v3_suspense as S
+        self._replaced_by_hidden()
+        self.engine.note_create("notes/observed/new.md", "newer open rule about widgets", {"id": "obs-new", "kind": "decision", "egress": "external_ok"})
+        with sqlite3.connect(self.state / "memory.sqlite3") as db:
+            db.execute(S.SCHEMA)
+            db.executemany("INSERT INTO suspense(new_id,nb_id,day,session,project) VALUES (?,?,'2026-11-15','s1','acme')", [("obs-closed", "obs-open"), ("obs-new", "obs-open")])
+        argv = ("card", "--session", "s1", "--project", "acme", "--cwd", str(self.root))
+        free, owner = self.run_cli(*argv), self.run_cli(*argv, MEMROVE_READER="local")
+        self.assertEqual(free.returncode, 0, free.stderr)
+        self.assertNotIn("obs-closed", free.stdout + free.stderr)
+        self.assertIn("open pairs: 2 in project, 2 this session [obs-new>obs-open]", free.stdout)   # the count is the whole truth, the ids only the visible pairs
+        self.assertIn("obs-closed>obs-open", owner.stdout)
+
+    def test_n3_replaces_error_names_no_hidden_replacer(self):
+        self._replaced_by_hidden()
+        argv = ("remember", "A later rule about widgets", "--kind", "decision", "--project", "acme", "--replaces", "obs-open", "--cwd", str(self.root))
+        free, owner = self.run_cli(*argv), self.run_cli(*argv, MEMROVE_READER="local")
+        self.assertEqual(free.returncode, 0, free.stderr)
+        self.assertIn("obs-open is already replaced;", free.stderr)
+        self.assertNotIn("obs-closed", free.stdout + free.stderr)
+        self.assertIn("obs-open is already replaced by obs-closed;", owner.stderr)
+
+    def test_n4_edge_summary_of_a_replaced_neighbour_names_no_hidden_replacer(self):
+        import memrove_v3_neighbours as nb
+        from unittest import mock
+        import io
+        mod = cli_module()
+        line = "REPLACED by obs-closed on 2026-11-15: history, do not use as current."
+        edges = [{"type": "supports", "dir": "out", "id": "obs-open", "summary": line, "why": "w"}]
+        for visible, expect in ((mod._record_check(self.state, "free"), "REPLACED on 2026-11-15: history, do not use as current."), (None, line)):
+            out = io.StringIO()
+            with mock.patch.object(nb, "edges_of", return_value=edges), mock.patch("sys.stdout", out), mock.patch("sys.stderr", out):
+                mod.cmd_show(mock.Mock(id="obs-open", visible=visible), mod.Context(self.vault, self.state))
+            self.assertEqual(json.loads(out.getvalue()[out.getvalue().index("{"):])["edges"][0]["summary"], expect)
+            self.assertEqual("obs-closed" in out.getvalue(), visible is None)
 
     def test_owner_harness_sees_everything_as_before(self):
         for env in ({"CLAUDECODE": "1"}, {"CODEX_THREAD_ID": "t"}, {"MEMROVE_READER": "local"}):

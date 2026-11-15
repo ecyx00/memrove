@@ -78,6 +78,22 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([i for i, _ in self.c.as_of("2026-07-01")], [new])
         self.assertEqual(self.c.expand(old)["record"]["valid_to"], "2026-06-01")
 
+    def test_close_changes_only_the_valid_to_line_of_a_hand_edited_note(self):
+        old = self.c.ingest({"kind": "decision", "text": "use postgres for the store", "why": "w", "valid_from": "2026-01-01"})[0]["id"]
+        with self.c.store._connect() as db:
+            f = self.t / "v" / json.loads(db.execute("SELECT payload FROM records WHERE id=?", (old,)).fetchone()[0])["source"]
+        meta, body = json.loads(f.read_text().split("---\n")[1]), f.read_text().split("---\n", 2)[2]
+        rows = ["---", "# owner comment: keep this", "tags: [infra, \"queue\"]", *(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in reversed(meta.items())), "---", *body.splitlines(), "last line no newline"]
+        f.write_bytes(b"\xef\xbb\xbf" + "\r\n".join(rows).encode("utf-8"))
+        start = f.read_bytes()
+        self.c.update(old, {"text": "use sqlite for the store", "why": "w", "valid_from": "2026-06-01"})
+        was, now = start.splitlines(keepends=True), f.read_bytes().splitlines(keepends=True)
+        self.assertEqual([l for l in was if l not in now], [])   # nothing the owner wrote changed
+        self.assertEqual([l for l in now if l not in was], [b'valid_to: "2026-06-01"\r\n'])   # CRLF kept, only the changed key
+        self.assertTrue(f.read_bytes().startswith(b"\xef\xbb\xbf---\r\n# owner comment"))   # BOM, first lines and comment stay
+        self.c.sync.sync()   # sync sees no hand edit (the stored hash follows the new bytes) and reads valid_to back
+        self.assertEqual(self.c.expand(old)["record"]["valid_to"], "2026-06-01")
+
     def test_open_record_stays_open_after_file_edit(self):
         rid = self.c.ingest({"kind": "decision", "text": "use postgres for the store", "why": "w", "valid_from": "2026-01-01"})[0]["id"]
         self._edit_and_sync(rid)

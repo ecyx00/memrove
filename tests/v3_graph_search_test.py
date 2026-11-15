@@ -6,12 +6,14 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'template/.claude/scripts'))
 sys.dont_write_bytecode = True
 import memrove_v3_chatlog as chatlog  # noqa: E402
 import memrove_v3_chatsearch as cs  # noqa: E402
+import memrove_v3_docsearch as docsearch  # noqa: E402
 
 
 class GraphSearchTest(unittest.TestCase):
@@ -23,6 +25,9 @@ class GraphSearchTest(unittest.TestCase):
         self.db.execute('CREATE TABLE records(id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         self.db.execute('CREATE TABLE graph_nodes(id TEXT PRIMARY KEY, kind TEXT, name TEXT, why TEXT, prov TEXT, at TEXT)')
         self.db.execute('CREATE TABLE graph_edges(src TEXT, dst TEXT, type TEXT, why TEXT, prov TEXT, at TEXT, PRIMARY KEY(src,dst,type))')
+        patch = mock.patch.object(docsearch, 'repos', return_value=[])   # search walks every docs/*.md of the repos on this machine: none here
+        patch.start()
+        self.addCleanup(patch.stop)
         old = cs.GRAPH_SHARE   # the share is of the plain output, which is one short line here (no docs tail): give the order tests room
         cs.GRAPH_SHARE = 5.0
         self.addCleanup(setattr, cs, 'GRAPH_SHARE', old)

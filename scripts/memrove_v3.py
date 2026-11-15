@@ -182,7 +182,7 @@ COMMANDS = {
         opt("--user", action="store_true", help="the owner said this (origin user_explicit); needs --quote, checked against the user messages of the chat log"),
         opt("--quote", help="with --user: the owner's exact words (16+ chars) as written in their message, in their own language; refused when no user message holds them"),
         opt("--session", help="default: CLAUDE_CODE_SESSION_ID, else the newest transcript of --cwd"),
-        opt("--replaces", "--supersedes", dest="supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; repeatable"),
+        opt("--replaces", "--supersedes", dest="supersedes", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one replaces; pass it when this save reverses or narrows an earlier record; repeatable"),
         opt("--rests-on", action="append", default=[], metavar="ID", help="record id (or unique prefix) this one builds on; repeatable, each needs a --why-link in the same order"),
         opt("--why-link", action="append", default=[], metavar="SENTENCE", help="why the matching --rests-on record is linked (not --why, which is the record's own reason)"),
         opt("--from", dest="from_msg", type=int, help="chat-log message id the idea came from; needs --span"),
@@ -561,8 +561,26 @@ MESSAGE_LINE = re.compile(r"^(\d+|x-[0-9a-f]+)\|")
 def _reader_lines(text, ok):
     """Search output for a reader that may not see every record: message lines stay, a rec: line stays when ok(id); heads, docs and graph
     neighbour lines (agent write-ups and records it cannot check) go. Allow-list, so a new line type stays hidden until it is added here."""
-    keep = [ln for ln in text.splitlines() if MESSAGE_LINE.match(ln) or ((m := re.match(r"^rec:([^|]+)\|", ln)) and ok(m.group(1)))]
+    keep, boundary = [], None
+    for ln in text.splitlines():
+        if ln.startswith("REPLACED "):   # the boundary line goes with the row after it, only when that row stays, and without a replacer id the reader may not see
+            boundary = _boundary(ln, ok)
+        elif MESSAGE_LINE.match(ln) or ((m := re.match(r"^rec:([^|]+)\|", ln)) and ok(m.group(1))):
+            ln = re.sub(r"\[replaced by (\S+?)\]", lambda t: t[0] if ok(t[1]) else "[replaced]", ln)   # the row's own tag names the replacer too
+            keep += [boundary, ln] if boundary else [ln]
+            boundary = None
+        else:
+            boundary = None
     return "\n".join(keep) if keep else "no message matches"
+
+
+def _boundary(line, ok):
+    """`REPLACED by <ids> on <day>: ...` for a reader: only the replacer ids ok(id) allows stay; none left -> `REPLACED on <day>: ...`."""
+    m = re.fullmatch(r"REPLACED by (.+?) on (.*)", line)
+    if not m or not ok:
+        return line
+    ids = [i for i in m[1].split(", ") if ok(i)]
+    return f"REPLACED by {', '.join(ids)} on {m[2]}" if ids else f"REPLACED on {m[2]}"
 
 
 def _record_check(state, tier):
@@ -594,11 +612,19 @@ def cmd_show(args, ctx):
         raise PermissionError(f"record {args.id} is not shown to this reader (egress label); the owner can set MEMROVE_READER=local for a harness that may see every record")
     out = show(ctx.store(), args.id.removeprefix("rec:"))
     _expose(ctx.state, "show", [str(out.get("id") if isinstance(out, dict) else args.id)], None)
+    if ok and isinstance(out, dict):   # the replacer's id is that record's too: drop it, keep that it was replaced (the REPLACED line below)
+        for key in ("superseded_by", "supersedes"):
+            if isinstance(out.get(key), list):
+                out[key] = [i for i in out[key] if ok(str(i))]
     if isinstance(out, dict) and out.get("kind") != "thread":
         import memrove_v3_neighbours as neighbours
         edges = [e for e in neighbours.edges_of(ctx.state, out.get("id", "")) if not ok or ok(str(e.get("id", "")))]   # a neighbour's summary is record text too
+        if ok:   # a replaced neighbour's summary is its REPLACED line: the same replacer-id check as the boundary line
+            edges = [{**e, "summary": _boundary(e["summary"], ok)} if str(e.get("summary", "")).startswith("REPLACED by ") else e for e in edges]
         if edges:
             out["edges"] = edges
+        if boundary := neighbours.replaced(ctx.state, out.get("id", "")):
+            print(_boundary(boundary, ok))   # before the record, so a reader meets it first
     return emit(out, ensure_ascii=False)
 
 
@@ -619,17 +645,12 @@ def cmd_remember(args, ctx):
     engine = ctx.engine()
     if len(args.rests_on) != len(args.why_link) or not all(w.strip() for w in args.why_link):
         raise ValueError("each --rests-on needs its own non-empty --why-link, in the same order")
-    replaced, rests = [], []
-    if args.supersedes or args.rests_on:
-        with engine.store._connect() as db:   # validate before anything is saved
-            replaced = [suspense.resolve(db, i) for i in args.supersedes]
-            rests = [(suspense.resolve(db, i), " ".join(w.split())) for i, w in zip(args.rests_on, args.why_link)]
     item = {"kind": args.kind, "text": args.text, "why": args.why, "project": project, "user": args.user, "quote": quote, "source": "memrove-cli",
-            "supersedes": args.supersedes, "topic": args.topic, "check": args.check, "measured": args.scope}
+            "topic": args.topic, "check": args.check, "measured": args.scope}
     sess = args.session or current_session(cwd)
     import memrove_v3_prov as prov
     item["provenance"] = prov.remember_fields(ctx.state, sess, args.from_msg, args.span)  # raises on a fake --from/--span: nothing is saved
-    result = ctx.core().ingest(item, scope={"agent": agent_of(args), "session": sess})[0]   # evidence mark, access check and relate run inside
+    result = ctx.core().ingest(item, scope={"agent": agent_of(args), "session": sess, "skip": [*args.supersedes, *args.rests_on]})[0]   # evidence mark, access check and relate run inside; relate skips the ids this save links
     if result["status"] == "denied":
         raise PermissionError("access.json does not let this agent write; pass --agent or set MEMROVE_AGENT")
     if result["status"] == "forgotten":
@@ -637,9 +658,12 @@ def cmd_remember(args, ctx):
     if result["status"] == "exists":
         print(result["id"] + " (exists)", file=sys.stderr)
     print(result["id"])
-    if replaced or rests:   # also for a record that already exists; the record is saved; a failed link is reported, never a lost save
+    replaced = []
+    if args.supersedes or args.rests_on:   # also for a record that already exists; the record is saved; a bad target or a failed link is reported, never a lost save
         try:
-            suspense.answer(engine, result["id"], replaced, rests, sess)
+            replaced, errors = suspense.answer(engine, result["id"], args.supersedes, list(zip(args.rests_on, (" ".join(w.split()) for w in args.why_link))), sess, getattr(args, "visible", None))
+            for e in errors:
+                print(e, file=sys.stderr)
         except Exception as exc:
             print(f"link not written ({type(exc).__name__}): answer with memrove settle {result['id']} <id> --replaces | --rests-on --why-link \"<why>\"", file=sys.stderr)
     if trigger:
@@ -654,7 +678,7 @@ def cmd_remember(args, ctx):
     if getattr(args, "visible", None):   # the nudge and topic lines quote other records and write-ups unfiltered: only a local reader gets them
         return 0
     if result["status"] != "exists" and args.kind != "note":   # offer() never raises: the record is already saved
-        for line in suspense.offer(engine, ctx.state, project, args.text, result["id"], sess, {*replaced, *(i for i, _ in rests)}):
+        for line in suspense.offer(engine, ctx.state, project, args.text, result["id"], sess, set(replaced)):
             print(line, file=sys.stderr)
     for p in result.get("proposals") or []:  # relate_new (MEMROVE_RELATE=1): older records this one may replace
         print(f"relate proposal: {p['src']} may replace {p['dst']}: {p['why']}", file=sys.stderr)
@@ -733,7 +757,7 @@ def cmd_card(args, ctx):
     card.upsert(engine, cid, meta, card._sources(engine, sid))
     print(cid)
     import memrove_v3_suspense as suspense
-    if line := suspense.card_line(engine, meta["project"], sid):   # counts and ids only
+    if line := suspense.card_line(engine, meta["project"], sid, getattr(args, "visible", None)):   # counts and ids only; a restricted reader gets the count and the visible pairs
         print(line)
     return 0
 

@@ -34,6 +34,8 @@ def _hash(data) -> str:
     raw = data.encode() if isinstance(data, str) else data
     return hashlib.sha256(raw).hexdigest()
 
+_UNRESOLVED = set()   # journals whose OSError this process already reported
+
 
 def atomic(path, text) -> None:
     """Write through a temp file in the same directory, then rename over the target."""
@@ -127,7 +129,7 @@ def _block(lines):
 
 def parse(text) -> tuple:
     """-> (metadata, body). JSON front matter, or flat YAML: scalars, inline lists, block lists, one-level mappings."""
-    parts = text.splitlines(keepends=True)
+    parts = text.removeprefix("\ufeff").splitlines(keepends=True)  # a BOM is not part of the first line
     if not parts or parts[0].strip() != "---":
         return {}, text  # no front matter
     end = next((i for i in range(1, len(parts)) if parts[i].strip() == "---"), None)
@@ -185,6 +187,50 @@ def render(metadata, body) -> str:
     return "---\n" + json.dumps(metadata, ensure_ascii=False, indent=2) + "\n---\n" + body
 
 
+def edit_front(text, fields):
+    """`text` with only the lines of the keys in `fields` changed (a falsy value drops the key); every other byte (BOM, comments, key order, line endings,
+    body) stays. -> None when the front matter cannot be edited that way (none, unreadable, not the JSON form render() writes or flat YAML), or when the
+    result does not parse back to the expected fields."""
+    lines = text.removeprefix("﻿").splitlines(keepends=True)
+    try:
+        meta, body = parse(text)
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except (ValueError, StopIteration):
+        return None
+    if not meta:
+        return None
+    eol = lines[0][len(lines[0].rstrip("\r\n")):] or "\n"
+    want = {**meta, **{k: v for k, v in fields.items() if v}}
+    for k in [k for k, v in fields.items() if not v]:
+        want.pop(k, None)
+    head = "".join(lines[1:end])
+    if head.lstrip().startswith("{"):   # the JSON form render() writes: only that exact form is rewritten, so only the changed keys' lines differ
+        dump = lambda m: json.dumps(m, ensure_ascii=False, indent=2).replace("\n", eol) + eol
+        if head != dump(meta):
+            return None
+        new = dump({**{k: v for k, v in fields.items() if v and k not in meta}, **want})   # a new key goes first: no line before it needs a comma (dropping the last key still changes the comma of the line before: JSON allows no trailing one)
+    else:   # flat YAML: replace or drop the key's own line (and its indented lines); a missing key is appended before the closing ---
+        out, skip, done = [], False, set()
+        for row in lines[1:end]:
+            found = None if row[:1].isspace() else re.fullmatch(_KEY, row.rstrip("\r\n"))
+            if found and found[1] in fields:
+                skip = not found[2].strip() or bool(re.fullmatch(r"[|>][+-]?(\s+#.*)?", found[2].strip()))   # only a block value owns the indented lines under it; under a scalar they are comments or blanks: kept
+                if fields[found[1]]:
+                    out.append(f"{found[1]}: {json.dumps(fields[found[1]], ensure_ascii=False)}{eol}")
+                    done.add(found[1])
+            elif skip and row[:1] in (" ", "\t"):
+                continue
+            else:
+                skip = False
+                out.append(row)
+        new = "".join(out) + "".join(f"{k}: {json.dumps(v, ensure_ascii=False)}{eol}" for k, v in fields.items() if v and k not in done)
+    text = text[:len(text) - len("".join(lines))] + lines[0] + new + "".join(lines[end:])
+    try:
+        return text if parse(text) == (want, body) else None
+    except ValueError:
+        return None
+
+
 # --- engine -------------------------------------------------------------------------------------
 
 class SyncEngine:  # reconciles Markdown files with the store; owns the write-ahead journal
@@ -197,6 +243,41 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
             db.execute("CREATE TABLE IF NOT EXISTS markdown_sources(id TEXT PRIMARY KEY, source TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS scan_state(source TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL)")
         self.links = Links(self.store)
+        self.rollback = self.state.joinpath("markdown-rollback")
+        self.resolve_rollbacks()
+
+    def resolve_rollbacks(self, db=None):
+        """A process killed between a note write and its commit leaves a journal here (memrove_v3_suspense._Journal): put each note back to its text
+        from before the write, unless the store already holds the write (the commit happened). Under the write lock (`db` when the caller holds it
+        already: sync), so a live writer finishes first. A file that is not a journal is moved to bad/ and never stops memrove."""
+        if not any(self.rollback.glob("*.json")):
+            return
+        if db is None:
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                return self.resolve_rollbacks(db)
+        for entry in sorted(self.rollback.glob("*.json")):
+            try:
+                entries = json.loads(entry.read_text(encoding="utf-8"))
+                if not isinstance(entries, list) or not all(isinstance(e, dict) and all(isinstance(e.get(k), str) for k in ("source", "old", "sha")) for e in entries):
+                    raise ValueError("not a list of {source, old, sha}")
+                for e in reversed(entries):
+                    path = self._path(e["source"])
+                    row = db.execute("SELECT json_extract(payload,'$.source_sha256') FROM records WHERE json_extract(payload,'$.source')=?", (e["source"],)).fetchone()
+                    if path.is_file() and _hash(path.read_bytes()) == e["sha"] and not (row and row[0] == e["sha"]):
+                        atomic(path, e["old"])
+                entry.unlink(missing_ok=True)
+            except OSError as exc:  # kept: the next command tries again; said once per process (the engine start and each sync inside one command run this)
+                if entry.name not in _UNRESOLVED:
+                    _UNRESOLVED.add(entry.name)
+                    print(f"memrove: rollback journal {entry.name} not resolved: {exc}", file=sys.stderr)
+            except ValueError as exc:  # unreadable, foreign or damaged (also a bad source path): it will never resolve, so it must not be retried every time
+                try:
+                    self.rollback.joinpath("bad").mkdir(exist_ok=True)
+                    entry.replace(self.rollback / "bad" / entry.name)
+                except OSError:
+                    pass
+                print(f"memrove: rollback journal {entry.name} is not a journal ({exc}); moved to {self.rollback.name}/bad/", file=sys.stderr)
 
     def projection_helpers(self) -> tuple:
         return (_hash, atomic, render)
@@ -367,6 +448,7 @@ class SyncEngine:  # reconciles Markdown files with the store; owns the write-ah
         """Bring the store in line with the Markdown files. full=False (hook path) reads only changed files."""
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.resolve_rollbacks(db)  # a writer killed since this engine was built left notes ahead of the store: put them back before they are read
             done, conflicts = self._recover()
             known = None if full else {r[0]: (r[1], r[2]) for r in db.execute("SELECT source,mtime_ns,size FROM scan_state")}
             records, warnings, dupes = self._scan(known, db)

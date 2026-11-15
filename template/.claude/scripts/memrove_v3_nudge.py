@@ -42,9 +42,12 @@ def neighbours(state, project, text, exclude=None, n=3):
 
 
 def line(neighbour, new):
-    """One 'may replace' line with the memrove settle command that answers it."""
+    """One question per neighbour, its three answers as ready `memrove settle` commands."""
     i, d, t = neighbour
-    return f"may replace: rec:{i} ({d} {t}) (answer: memrove settle {new} {i} --replaces | --rests-on --why-link \"<why>\" | --unrelated)"
+    return (f"neighbour rec:{i} ({d} {t}): can the new record stand in for {i} everywhere?\n"
+            f"  yes: memrove settle {new} {i} --replaces\n"
+            f"  it narrows or builds on it: memrove settle {new} {i} --rests-on --why-link \"<why>\"\n"
+            f"  neither: memrove settle {new} {i} --unrelated")
 
 
 def topic_line(state, project, n=8):

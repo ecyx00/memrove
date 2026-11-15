@@ -28,6 +28,14 @@ def _edges(db, rid):
     return [(t, "out" if s == rid else "in", d if s == rid else s, w) for s, d, t, w in rows]
 
 
+def replaced_line(db, rid):
+    """The fixed boundary line for a record a live record replaces (its `supersedes` holds it), else ''. Ids and a date only, no record text."""
+    from memrove_v3_nudge import GONE
+    rows = [json.loads(p) for (p,) in db.execute("SELECT payload FROM records WHERE id<>? AND EXISTS (SELECT 1 FROM json_each(payload,'$.supersedes') j WHERE j.value=?)", (rid, rid))]
+    live = sorted((str(r.get("valid_from") or r.get("created_at") or "")[:10], r["id"]) for r in rows if r.get("status") not in GONE)
+    return f"REPLACED by {', '.join(i for _, i in live)} on {live[0][0]}: history, do not use as current." if live else ""
+
+
 def _node(db, oid):
     """-> (handle, summary) of a live record or a concept, else None (missing, retired, private, expired)."""
     if oid.startswith("concept:"):
@@ -41,11 +49,16 @@ def _node(db, oid):
         return None
     if str(r.get("valid_to") or "") and str(r["valid_to"]) <= datetime.now(timezone.utc).replace(tzinfo=None).isoformat():
         return None
-    return "rec:" + oid, _clip(r.get("title") or r.get("text") or r.get("approach"), SUMMARY)
+    sup = getattr(db, "sup", None)   # ids some record's `supersedes` names, scanned once per _run (a bare connection checks every record)
+    return "rec:" + oid, (sup is None or oid in sup) and replaced_line(db, oid) or _clip(r.get("title") or r.get("text") or r.get("approach"), SUMMARY)   # a replaced record shows the boundary line, not its text
 
 
 def _label(t, d):
     return "replaced-by" if (t, d) == ("supersedes", "in") else t
+
+
+class _DB(sqlite3.Connection):
+    sup = None
 
 
 def _run(state, fn):
@@ -53,8 +66,9 @@ def _run(state, fn):
     if not path.exists():
         return None
     try:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30, factory=_DB)
         try:
+            db.sup = {v for (v,) in db.execute("SELECT j.value FROM records, json_each(records.payload,'$.supersedes') j")}
             return fn(db)
         finally:
             db.close()
@@ -96,6 +110,11 @@ def edges_of(state, rid):
             out.append({"type": t, "dir": d, "id": node[0] if node else oid, "summary": node[1] if node else "(gone)", "why": why})
         return out
     return _run(state, run) or []
+
+
+def replaced(state, rid):
+    """replaced_line of one record (for `memrove show`), '' when it has no live replacer or on any error."""
+    return _run(state, lambda db: replaced_line(db, rid.removeprefix("rec:"))) or ""
 
 
 def record_row(state, rid):

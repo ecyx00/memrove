@@ -79,7 +79,7 @@ class Checks(unittest.TestCase):
         c.run_all(sync.store, self.state)
         self.assertEqual(c.notice(self.state), "1 records may be stale: `memrove doctor`\n")
         new = self.remember("Quokka cache is disabled now", "--supersedes", old).stdout.strip()
-        shown = json.loads(self.cli("show", old).stdout)
+        shown = json.loads(self.cli("show", old).stdout.split("\n", 1)[1])   # the first line is the REPLACED boundary line
         self.assertEqual((shown["status"], shown["superseded_by"]), ("superseded", [new]))
         self.assertEqual(c.notice(self.state), "")  # cached failure dropped on supersede
         self.assertNotIn(old, c.run_all(self._sync().store, self.state))  # and never re-checked

@@ -36,6 +36,7 @@ class InjectedTextsTest(unittest.TestCase):
         for t in (ct.INSTRUCTION, re.search(r"ONE_LINE = '(.*)'\n", CHAT_TS).group(1)):
             self.assertIn("not evidence", t)
         self.assertIn("search first", re.search(r"ONE_LINE = '(.*)'\n", CHAT_TS).group(1))
+        self.assertIn("REPLACED is history; newer record or code wins; name the conflict", re.search(r"ONE_LINE = '(.*)'\n", CHAT_TS).group(1))   # the short note keeps the precedence line
 
     def test_agents_block_has_no_stale_promises(self):
         src = (ROOT / "scripts/install_v3.py").read_text()

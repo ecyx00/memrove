@@ -92,8 +92,8 @@ export function inBackoff(failures: number, lastFailureAt: number, now: number):
 }
 
 /** What the classic SessionStart instruction becomes when the view itself is in the context. */
-export const ONE_LINE = 'Before you answer or start a task that may build on earlier work, search first; a hit or a doc line is a lead, not evidence; open it with zoom or memrove doc and answer from what you opened. On one topic the newer statement wins, and the user\'s word beats an agent\'s. Tools: search, zoom (id, n), date.'
-const INSTRUCTION_MARK = 'Memrove chat memory is on'
+export const ONE_LINE = 'Before you answer or start a task that may build on earlier work, search first; a hit or a doc line is a lead, not evidence; open it with zoom or memrove doc and answer from what you opened. On one topic the newer statement wins, and the user\'s word beats an agent\'s. REPLACED is history; newer record or code wins; name the conflict. Tools: search, zoom (id, n), date.'
+const INSTRUCTION_MARK = 'Memrove chat memory'   // the header of the classic note, old ('... is on') and new ('... (usage note)')
 
 export function shortenInstruction(texts: readonly string[] | undefined): string[] | undefined {
   if (texts === undefined) return undefined

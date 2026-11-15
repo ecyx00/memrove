@@ -55,10 +55,11 @@ def _private(text, state):
     return secrets.redact(text, state)[0] != text or bool(_PRIVATE.search(text))
 
 
-def relate_new(core, rec, agent=None):
+def relate_new(core, rec, agent=None, skip=()):
     """Typed edges from a just-written live record to its 3 nearest older live ones (lexical overlap). Off unless MEMROVE_RELATE=1;
     decider "none" (nothing sent) unless MEMROVE_RELATE_REMOTE=1 too, then pairs with secrets/emails/query URLs/home paths are skipped. Never raises.
-    -> supersedes proposals [{src, dst, why}], also appended to state/reflect-proposals.jsonl. core.relate_decider: name or callable."""
+    -> supersedes proposals [{src, dst, why}], also appended to state/reflect-proposals.jsonl. core.relate_decider: name or callable.
+    skip: record ids or prefixes the same save names in --replaces / --rests-on; the save writes those links itself, so relate never proposes them."""
     if os.environ.get("MEMROVE_RELATE") != "1" or not rec.get("id"):
         return []
     remote = os.environ.get("MEMROVE_RELATE_REMOTE") == "1"
@@ -72,7 +73,7 @@ def relate_new(core, rec, agent=None):
         if not live(me):
             return []
         new = {"id": me["id"], "text": me["text"], "valid_from": me.get("valid_from")}
-        older = [{"id": r["id"], "text": r["text"], "valid_from": r.get("valid_from")} for r in rows if live(r) and str(r.get("valid_from") or "") <= str(new["valid_from"] or "")]
+        older = [{"id": r["id"], "text": r["text"], "valid_from": r.get("valid_from")} for r in rows if live(r) and str(r.get("valid_from") or "") <= str(new["valid_from"] or "") and not any(s and r["id"].startswith(s.removeprefix("rec:")) for s in skip)]
         top = sorted(older, key=lambda o: relate.overlap(o["text"], new["text"])[0], reverse=True)[:3]  # shortcut: full scan, upgrade to FTS at ~10k records
         if remote:
             top = [o for o in top if not (_private(o["text"], core.state) or _private(new["text"], core.state))]
@@ -138,7 +139,7 @@ class Core:
                     evidence.mark(self, out[-1]["id"])  # shortcut: loads the whole chat log per call, pass a cached log= if ingest gets hot
                 except Exception as e:  # a failed verdict must never fail the write; class name only
                     print(f"memrove: evidence mark failed: {type(e).__name__}", file=sys.stderr)
-            out[-1]["proposals"] = relate_new(self, out[-1], agent)
+            out[-1]["proposals"] = relate_new(self, out[-1], agent, scope.get("skip") or ())
         return out
 
     def _one(self, db, rid):
@@ -180,14 +181,17 @@ class Core:
     def _fields_to_file(self, rec, keys):
         """A close or a reflect mark is also written into the source file's front matter, so a store rebuilt from the vault keeps it.
         rec["source_sha256"] follows the new bytes, so sync does not see a hand edit."""
-        from memrove_v3_sync import _hash, atomic, parse, render
+        from memrove_v3_sync import _hash, atomic, edit_front
         try:
             path = self.sync._path(rec["source"], existing=True)
-            meta, body = parse(path.read_text(encoding="utf-8"))
+            old = path.read_bytes().decode("utf-8")  # bytes, not read_text: no newline translation
         except (KeyError, ValueError, OSError):
             return  # no file behind this record
-        meta.update({k: rec[k] for k in keys if rec.get(k)})
-        text = render(meta, body)
+        if (text := edit_front(old, {k: rec[k] for k in keys if rec.get(k)})) is None:  # only the changed keys' lines are edited
+            print(f"memrove: {rec['source']}: front matter cannot be edited safely; {', '.join(keys)} kept in the store only", file=sys.stderr)
+            return
+        if text == old:
+            return
         atomic(path, text)
         rec["source_sha256"] = _hash(text)
 

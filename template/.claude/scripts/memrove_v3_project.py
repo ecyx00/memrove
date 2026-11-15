@@ -372,10 +372,15 @@ def entry(db, vault, project, limit=5000, decisions=6, old=3, state=None):
     if not mine:
         known = sorted({n["project"] for n in nodes.values() if n["project"] and n["project"] != g.GENERIC and n["kind"] != "concept"})
         return f"no project {project!r}; projects: " + ", ".join(known)
-    newer = {}  # old id -> id of the record that replaced it (record field or a stored supersedes edge)
+    from memrove_v3_nudge import GONE
+    newer, linked, proposed = {}, {}, {}  # old id -> id of the record that replaced it (record field or a stored supersedes edge); linked: only a live record's own `supersedes` field; proposed: other edges
     for e in g.all_edges(db, nodes):
         if e["type"] == "supersedes" and not e["dst"].startswith(("concept:", "project:")):
             newer.setdefault(e["dst"], e["src"])
+            if e["prov"].get("basis") != "derived":   # a stored edge (a model may have inferred it) is never shown as a fact
+                proposed.setdefault(e["dst"], e["src"])
+            elif nodes[e["src"]].get("status") not in GONE:   # and the replacer must be live
+                linked.setdefault(e["dst"], e["src"])
     order = lambda n: (n.get("ts") or n["day"], n["id"])  # full timestamp when the record has one; a date-only record sorts first within its day
     decs = sorted((n for n in mine if n["kind"] == "decision" and n.get("status") != "dropped_llm"), key=order, reverse=True)
     cur = [n for n in decs if n["id"] not in newer and n.get("status") != "superseded"]
@@ -388,8 +393,9 @@ def entry(db, vault, project, limit=5000, decisions=6, old=3, state=None):
     for n in cur[:decisions]:
         out.append(f"  rec:{n['id']} {n['day']} {_t(n['title'], 110)}")
     for n in gone[:old]:
-        by = newer.get(n["id"])
-        out.append(f"  rec:{n['id']} {n['day']} {_t(n['title'], 90)} [SUPERSEDED" + (f" by rec:{by}" if by else "") + "]")
+        by_link = linked.get(n["id"])
+        out.append(f"  rec:{n['id']} REPLACED by rec:{by_link} on {nodes[by_link]['day']}: history, do not use as current. {_t(n['title'], 90)}" if by_link   # the boundary line first, then the old title
+                   else f"  rec:{n['id']} {n['day']} {_t(n['title'], 90)} [SUPERSEDED" + (f"; proposal: rec:{proposed[n['id']]} may replace it" if n["id"] in proposed else "") + "]")
     names = {name, *(str(project).split("/")[-1:] if project else [])}
     loops = sorted((n for n in mine if n["kind"] == "card" and n.get("open")), key=order, reverse=True)
     try:
