@@ -12,7 +12,7 @@ It works with Claude Code and Codex. The command-line tool is `memrove`.
 
 ## What you get
 
-- **Every message, kept unchanged.** Hooks record each session into one SQLite file. Search is full-text (FTS5, BM25) over messages, records and your project docs.
+- **Every message, kept unchanged.** Hooks append each session to a local chat log. Search is full-text (SQLite FTS5, BM25) over messages, records and your project docs.
 - **Decisions with their reasons.** `memrove remember` saves a `decision`, `rejected`, `lesson`, `preference` or `note` with its `why`.
 - **History that stays honest.** A new record can replace an old one. The old record stays in the store and is marked `REPLACED`, so an agent does not act on a stale decision.
 - **A map of the whole history.** A summary tree lets an agent start from one line and open it down to the original messages.
@@ -82,22 +82,45 @@ memrove show obs-ffc304
 
 ```mermaid
 flowchart LR
-  A[Agent session] --> B[hooks]
-  B --> C[(SQLite chat log)]
-  C --> D[summary tree]
-  B --> E[typed records<br/>Markdown files]
-  D --> F[CLI and MCP tools]
-  E --> F
-  C --> F
-  F --> A
+  subgraph cap [Capture]
+    A[Claude Code<br/>Codex]
+    O[Cursor, ChatGPT, 5 more<br/>by import]
+  end
+  subgraph mem [Local memory]
+    L[chat log<br/>append-only]
+    T[summary tree]
+    R[records<br/>Markdown + SQLite]
+    G[record graph]
+    X[(FTS5 index)]
+  end
+  D[project docs]
+  subgraph next [Next session]
+    C[CLI and MCP tools]
+    N[agent]
+  end
+  A -->|hooks| L
+  O --> L
+  A -->|remember| R
+  L --> T
+  R -.->|cites| L
+  R --> G
+  L --> X
+  R --> X
+  D --> X
+  X -->|search| C
+  T -->|wake, zoom| C
+  G -->|neighbours| C
+  C -->|on demand| N
+  R -->|rules, last card| N
 ```
 
-1. **Hooks** in Claude Code and Codex write each message to the chat log. Adapters for Hermes, OpenCode and OMP are in `template/.claude/scripts/`.
-2. **The summary tree** is built over the log by a small model (Claude Haiku, through your Claude Code login). Set `MEMROVE_NO_LLM=1` to turn the Haiku calls off. Search and records work without them.
-3. **Typed records** are Markdown files in the vault. Links between them are `[[links]]`, so Obsidian's graph view shows the memory. `memrove graph neighbors <id>` lists the links of one record.
-4. **The agent reads** through the CLI. The `mods/memrove-chat` plugin also gives Claude Code the model tools `zoom`, `date` and `project` (`claude --plugin-dir mods/memrove-chat`).
+1. **Capture.** Hooks in Claude Code and Codex append each message to the chat log, unchanged. `memrove import-sessions` and `import-chats` read past history from Codex, Cursor, ChatGPT, Copilot, OpenCode, NotebookLM and Antigravity. Adapters for Hermes and OMP are in `template/.claude/scripts/`.
+2. **Summary tree.** A small model (Claude Haiku, through your Claude Code login) summarises the log into a tree. `wake` shows its top lines and `zoom` opens a line down to the messages.
+3. **Records.** `memrove remember` writes a Markdown file to the vault and a row to SQLite. A record can cite its source message, and the code checks the quote before it saves. A replace is one transaction. The old record stays and is marked `REPLACED`.
+4. **Record graph.** Records are linked by typed edges: `supersedes`, `relates`, `contradicts`, `answers`, `part_of`. Search shows the neighbours of its top record hits. `memrove graph neighbors <id>` lists the links of one record, and Obsidian's graph view draws the vault.
+5. **Read.** A new session gets a short note, your standing rules and the last handoff card. Everything else the agent pulls: one BM25 search over messages, records and project docs, then `zoom`, `show` or `brief`. The `mods/memrove-chat` plugin gives Claude Code the model tools `zoom`, `date` and `project` (`claude --plugin-dir mods/memrove-chat`).
 
-A record can cite the message it came from, and the code checks the quote before it saves. A reader other than Claude Code, Codex or your own terminal sees only the records its tier allows (`MEMROVE_READER`).
+Set `MEMROVE_NO_LLM=1` to turn the Haiku calls off. Search and records work without them. A reader other than Claude Code, Codex or your own terminal sees only the records its tier allows (`MEMROVE_READER`).
 
 ## Configuration
 
