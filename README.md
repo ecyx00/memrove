@@ -131,7 +131,7 @@ The harnesses for the public sets LongMemEval-S and LoCoMo are in `bench/`.
 - Answer accuracy is below the target: 0.662 against 0.90.
 - The evaluation uses the author's private chats. Only the method and the numbers are public.
 - The samples are small: most per-type results have 11 graded items.
-- Tested on macOS. Linux is in the CI matrix. Windows code paths exist and are not tested.
+- Tested on macOS. Linux and Windows code paths exist and are not tested.
 
 ## Development
 
