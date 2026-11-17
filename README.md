@@ -1,89 +1,145 @@
 # memrove
 
-Local cross-session memory for Claude Code and Codex. It stores every chat message verbatim, builds a summary tree over them, and lets an agent rove through its memory on demand. The command-line tool is `memrove`.
+[![tests](https://github.com/ecyx00/memrove/actions/workflows/v3.yml/badge.svg)](https://github.com/ecyx00/memrove/actions/workflows/v3.yml)
+
+**Long-term memory for AI coding agents. Local, plain files, no server.**
+
+A new agent session starts with no memory of the last one, so you brief it again. memrove keeps every message of every session, the decisions you made and the reasons for them. The next session reads its memory and continues the work.
+
+It works with Claude Code and Codex. The command-line tool is `memrove`.
 
 ![Memory graph of a real install, labels removed](docs/graph.png)
 
-Memory graph of a real install, labels removed. Nodes are notes, edges are `[[links]]`, colors are note kinds.
+## What you get
 
-## What it is
+- **Every message, kept unchanged.** Hooks record each session into one SQLite file. Search is full-text (FTS5, BM25) over messages, records and your project docs.
+- **Decisions with their reasons.** `memrove remember` saves a `decision`, `rejected`, `lesson`, `preference` or `note` with its `why`.
+- **History that stays honest.** A new record can replace an old one. The old record stays in the store and is marked `REPLACED`, so an agent does not act on a stale decision.
+- **A map of the whole history.** A summary tree lets an agent start from one line and open it down to the original messages.
+- **The agent pulls, memrove does not push.** A session starts with a short note and your standing rules. The agent searches the rest when it needs it.
+- **Your data stays with you.** Records are Markdown files with `[[links]]` in a folder you choose. The engine uses the Python standard library only.
 
-- **Verbatim chat log.** Every user and assistant message is kept unchanged in SQLite, indexed with FTS5 and ranked with BM25.
-- **Summary tree.** Haiku summarises the log into a tree of nodes. Agents navigate it with three tools: `search` (BM25 over messages, records and docs), `zoom(id, n)` (open a node or message) and `date(id)` (when a message was written). Nothing is pushed into the agent's context by default; the agent pulls what it needs.
-
-![memrove search then zoom finds a past decision in a demo vault](docs/search-zoom.png)
-
-- **Typed records.** `memrove remember` stores a `decision`, `rejected`, `lesson`, `preference` or `note` with a `why` and an optional `supersedes` link. A superseded record stays in the store and is marked as replaced.
-
-![memrove remember with --supersedes, then memrove project marks the old decision as superseded](docs/records.png)
-
-- **MCP tools and a CLI.** The `mods/memrove-chat` Claude Code plugin registers `zoom`, `date` and `project` as model tools. The same functions are available as `memrove search`, `memrove zoom`, `memrove project`, `memrove remember`, `memrove doctor` and others.
-- **Grab.** Quick capture (⌃⌥B) of text, screenshots or links into memrove memory, with local Vision OCR. Commands: `memrove grab add|process|install`.
-
-![The memrove Grab panel with demo text, and the saved card](docs/grab.png)
-
-- **Hooks.** Hook scripts for Claude Code and Codex ingest sessions, add a short past-reference hint, and keep the index fresh. Hermes, OpenCode and OMP adapters are in `template/.claude/scripts/`.
-- **Writer heartbeat.** Each background writer (chat compactor, session cards, threads) writes `<state>/heartbeat/<writer>.json` after every run. `memrove doctor` reports a chat-driven writer with no heartbeat 24 hours after first use, so a silent writer does not go unnoticed.
-
-## Architecture
-
-```mermaid
-flowchart LR
-  A[Claude Code / Codex session] --> B[hooks]
-  B --> C[(SQLite FTS5 chat log)]
-  C --> D[Haiku summary tree]
-  C --> E[typed records]
-  D --> F[CLI + MCP: search / zoom / date / project]
-  E --> F
-  F --> A
-```
-
-The engine uses the Python standard library only. State lives in one directory (`--state`); the vault holds the installed scripts. The `memrove-chat` plugin is TypeScript and only drives the CLI.
-
-## Install
+## Quick start
 
 Requires Python 3.11 or newer. macOS is the tested platform.
 
 ```sh
-git clone <this repo> memrove && cd memrove
-python3 scripts/install_v3.py --vault /path/to/vault --plan   # show what would change
-python3 scripts/install_v3.py --vault /path/to/vault          # install
-python3 /path/to/vault/memrove.py doctor                        # check
+git clone https://github.com/ecyx00/memrove && cd memrove
+python3 scripts/install_v3.py --vault ~/memory --plan   # show what the install changes
+python3 scripts/install_v3.py --vault ~/memory          # install
+python3 ~/memory/memrove.py doctor                      # check
 ```
 
-Open the vault folder in a new Claude Code or Codex session. In Codex, review and trust the new hooks with `/hooks`. For the `zoom`, `date` and `project` model tools in Claude Code, load the plugin in `mods/memrove-chat` (`claude --plugin-dir mods/memrove-chat`); its options are in `mods/memrove-chat/README.md`. To update, `git pull` and rerun `install_v3.py` with the same options (it rewrites only files that changed); to undo the global wiring, run it with `--global --uninstall`. The engine needs no accounts, API keys or servers. `install_v3.py` backs up what it touches and writes no global settings unless `--global` is given.
+Open the vault folder (`~/memory` here) in a new Claude Code or Codex session. In Codex, trust the new hooks with `/hooks`.
 
-Installer options: `--python EXE` picks the interpreter baked into the hooks and the `memrove` wrapper (the installer warns when the running python looks like conda or a venv, which breaks when that environment goes away); `--workspace-root DIR` (repeatable) lists a folder whose direct subfolders are separate projects, for one big vault of many apps, even when the folder holds a `CLAUDE.md` or subfolders hold their own markers. Keep memrove's own vault outside that folder: a session inside memrove's vault resolves to no project.
+The install writes into the vault only. Add `--global` to connect memrove to every project on the machine and to put the `memrove` command in `~/.local/bin`. `--global --uninstall` removes both. The installer makes a backup of each file it changes.
 
-Doc search (`memrove search` doc handles) reads write-ups under `<repo>/docs/{state,audits,research,design,handoff,decisions}` of the repos named in `MEMROVE_DOC_REPOS` (a `:`-separated list of repo directories or globs such as `~/Projects/*`; a glob keeps only directories with a `docs/` folder and is expanded on every search) and of nothing else by default.
+## Use
 
-### Viewing the graph
+The examples use the `memrove` command. Without `--global`, type `python3 ~/memory/memrove.py` in its place.
 
-The vault is plain Markdown with `[[links]]`, so Obsidian's graph view or `memrove graph` shows it.
+Save a decision, then find it in a later session:
 
-Tests: `python3.14 scripts/test_parallel.py`.
+```sh
+memrove remember "The API uses SQLite, not Postgres" --kind decision --why "one file, no server to operate"
+memrove search "sqlite postgres"
+```
 
-## How it was evaluated
+```
+rec:obs-40e269a159a22f962865f4f9|2026-11-17|decision|The API uses SQLite, not Postgres
+```
 
-The evaluation is job-based. The question is whether an agent that starts a new session can continue without being re-briefed, not whether a search finds an arbitrary message. The question set has 136 items in 5 types: 30 decision-why, 23 state, 30 tried-and-rejected, 23 real prompts, 30 abstain. The agent answers with the production tools and Haiku grades each answer against key facts. Weights follow the type mix of real past-reference prompts. Design note: `2026-10-11-memory-eval-redesign.md`; item list: `2026-10-11-e87-job-set.md`. Every source named below is a private working note of the author and is not in this repository.
+![memrove search, then zoom, finds a past decision in a demo vault](docs/search-zoom.png)
 
-- **Baseline (e87 baseline-v2).** 55 items graded. Weighted answer accuracy 0.662 (95% bootstrap 0.538-0.787), strict accuracy (every key fact) 0.448, target 0.90. Correct per type: decision-why 8/11, state 5/11, tried-rejected 11/11, real prompt 5/11, abstain 10/11. False abstains on answerable items: 6 of 44. Source: `2026-10-11-e87-baseline-v2-report.txt`.
-- **Docs channel (e88).** Adding a docs section to search took state questions from 7 to 14 of 23 correct. Real-prompt questions went from 13 to 9 of 23 (1 win, 5 losses). Over both types, 20 became 23 of 46 (exact sign p = 0.581, not significant). Fresh tokens per question rose 14%. Source: `2026-10-12-e88-docs.md`.
-- **Past-reference detector (e80).** Held-out precision 0.931 and recall 0.771 (27 true positives, 2 false positives, 8 false negatives). The sets are small, about 35 positives per half, and prevalence is inflated, so precision on real traffic will be lower. Source: `2026-10-11-e80-texts.md`; the shipped version is in `2026-10-12-inject-ship.md`.
+Replace it when the decision changes. The old record is kept and marked:
 
-**Measured and rejected** (from the author's decision ledger, `2026-10-12-e92-ledger-sample.md`, and the e92 write-up):
+```sh
+memrove remember "The API moved to Postgres" --kind decision --why "two writers now" --replaces obs-40e269
+```
 
-- BM25 plus a static dense embedder (RRF) reached at best 38/60 best-evidence@8, against 41/60 for BM25 alone.
-- Cross-encoder reranking (bge-reranker-v2-m3 over the BM25 top 200) cut gold@8 from 9 to 5, took about 10 s per query and 3.8 GB of RAM.
-- Local decision models on 737 decision items: d1-omni-600M scored 60.5%, clef-text-0.6b scored 64.9% (`2026-10-12-decision-models-catalog.md`).
-- Haiku-proposed automatic supersede marks: precision judged by Sonnet on 40 pairs was 0.40 (loose prompt) and 0.60 (strict prompt), against a 0.9 gate (`2026-10-12-e92-ledger.md`). They are not applied automatically.
+![memrove remember with a replaced record](docs/records.png)
+
+| Command | What it does |
+| --- | --- |
+| `memrove search "<words>"` | Messages, records and docs in one ranked list |
+| `memrove show <id>` | One record in full, with its links |
+| `memrove wake` | The map of the chat history, one line per part |
+| `memrove zoom <id> <n>` | Open a map line down to its messages |
+| `memrove remember "<text>" --kind … --why …` | Save a record |
+| `memrove brief "<topic>"` | The reading list of a topic: its docs and its live decisions |
+| `memrove card --did … --next …` | Leave a handoff card for the next session |
+| `memrove grab add` | Capture text, a screenshot or a link (⌃⌥B on macOS, local OCR) |
+| `memrove backup --dest <dir>` | Copy the vault and the state into an empty folder |
+| `memrove doctor` | Health of the hooks and the background writers |
+
+`memrove --help` lists all commands.
+
+![The memrove Grab panel with demo text, and the saved card](docs/grab.png)
+
+## How it works
+
+```mermaid
+flowchart LR
+  A[Agent session] --> B[hooks]
+  B --> C[(SQLite chat log)]
+  C --> D[summary tree]
+  B --> E[typed records<br/>Markdown files]
+  D --> F[CLI and MCP tools]
+  E --> F
+  C --> F
+  F --> A
+```
+
+1. **Hooks** in Claude Code and Codex write each message to the chat log. Adapters for Hermes, OpenCode and OMP are in `template/.claude/scripts/`.
+2. **The summary tree** is built over the log by a small model (Claude Haiku, through your Claude Code login). Set `MEMROVE_NO_LLM=1` to turn the Haiku calls off. Search and records work without them.
+3. **Typed records** are Markdown files in the vault. Links between them are `[[links]]`, so Obsidian's graph view or `memrove graph` shows the memory.
+4. **The agent reads** through the CLI. The `mods/memrove-chat` plugin also gives Claude Code the model tools `zoom`, `date` and `project` (`claude --plugin-dir mods/memrove-chat`).
+
+A record can cite the message it came from, and the code checks the quote before it saves. A reader other than Claude Code, Codex or your own terminal sees only the records its tier allows (`MEMROVE_READER`).
+
+## Configuration
+
+| Setting | Use |
+| --- | --- |
+| `--python EXE` (installer) | The interpreter that the hooks and the `memrove` wrapper use |
+| `--workspace-root DIR` (installer) | A folder whose direct subfolders are separate projects. Repeatable |
+| `MEMROVE_DOC_REPOS` | `:`-separated repo folders or globs (`~/Projects/*`). Search reads their `docs/{state,audits,research,design,handoff,decisions}` |
+| `MEMROVE_NO_LLM=1` | No Haiku calls |
+| `MEMROVE_READER=local\|paid\|free` | Set the reader tier by hand, for a script or another agent tool |
+
+To update, `git pull` and run `install_v3.py` again with the same options. It writes only the files that changed.
+
+## Evaluation
+
+The test is a job: can an agent in a new session continue the work with no new brief? The set has 136 questions in 5 types (why a decision was made, current state, tried and rejected, real prompts, questions with no answer). The agent answers with the production tools and a model grades each answer against key facts.
+
+| Measure | Result |
+| --- | --- |
+| Weighted answer accuracy, 55 graded items | 0.662 (95% interval 0.538 to 0.787). The target is 0.90 |
+| Tried-and-rejected questions | 11 of 11 correct |
+| State questions | 5 of 11 correct |
+| Past-reference detector, held out | precision 0.931, recall 0.771 |
+
+Measured and not shipped:
+
+- BM25 with a dense embedder: at best 38 of 60, against 41 of 60 for BM25 alone.
+- Cross-encoder reranking: fewer correct top results, about 10 s per query, 3.8 GB of memory.
+- Automatic "this replaces that" marks from a model: precision 0.40 to 0.60 against a gate of 0.90. A replacement is always an explicit `--replaces`.
+
+The harnesses for the public sets LongMemEval-S and LoCoMo are in `bench/`.
 
 ## Limits
 
-- Answer accuracy is below the 90% target: 0.662 weighted on the baseline above.
-- The evaluation runs on the author's private chats, so outsiders cannot reproduce it. Only the method and the numbers are public.
-- Tested on macOS only. Windows and Linux code paths and CI files exist but were not exercised for this release.
-- Samples are small: most per-type results rest on 11 graded items, with wide intervals.
+- Answer accuracy is below the target: 0.662 against 0.90.
+- The evaluation uses the author's private chats. Only the method and the numbers are public.
+- The samples are small: most per-type results have 11 graded items.
+- Tested on macOS. Linux is in the CI matrix. Windows code paths exist and are not tested.
+
+## Development
+
+```sh
+python3 scripts/test_parallel.py   # offline test suite, no network and no model calls
+```
 
 ## License
 
