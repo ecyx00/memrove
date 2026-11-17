@@ -7,3 +7,6 @@ release/
 # private working notes
 docs/state/
 papercuts.md
+
+# local agent worktrees
+/.claude/

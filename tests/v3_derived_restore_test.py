@@ -97,7 +97,7 @@ class EntitySourceTest(et.Base):
 class RestoreTest(Base):
     def cli(self, vault, state, *args):
         r = subprocess.run([sys.executable, str(ROOT / 'scripts/memrove_v3.py'), '--vault', str(vault), '--state', str(state), *args],
-                           capture_output=True, text=True, encoding='utf-8', env=inherited_env())
+                           capture_output=True, text=True, encoding='utf-8', env=inherited_env(MEMROVE_READER='local'))
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout)
 
@@ -130,7 +130,7 @@ class RestoreTest(Base):
         self.assertEqual(res['consistency']['missing'], [])
         # restore never overwrites
         again = subprocess.run([sys.executable, str(ROOT / 'scripts/memrove_v3.py'), '--vault', str(self.vault), '--state', str(self.state), 'restore', '--from', str(dest)],
-                               capture_output=True, text=True, env=inherited_env())
+                               capture_output=True, text=True, env=inherited_env(MEMROVE_READER='local'))
         self.assertNotEqual(again.returncode, 0)
 
         from memrove_v3_sync import SyncEngine
@@ -197,7 +197,7 @@ class RestoreTest(Base):
         self.engine.sync()
         def run(*a):
             r = subprocess.run([sys.executable, str(ROOT / 'scripts/memrove_v3.py'), '--vault', str(self.vault), '--state', str(self.state), *a],
-                               capture_output=True, text=True, encoding='utf-8', env=inherited_env())
+                               capture_output=True, text=True, encoding='utf-8', env=inherited_env(MEMROVE_READER='local'))
             self.assertEqual(r.returncode, 0, r.stderr)
             return r.stdout
         out = run('search', '--records', '--compact', 'android desteği').splitlines()[0]

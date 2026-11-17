@@ -94,6 +94,7 @@ class TriggerTest(unittest.TestCase):
         self.cli("remember", "Quote lesson.", "--kind", "lesson", "--cwd", str(self.proj), "--trigger-tool", "Bash", "--trigger", 'echo "x"')
         self.assertNotEqual(self.hook(command='echo "x" > f'), {})
 
+    @unittest.skipIf(os.environ.get("CI"), "a wall-clock bound measures the CI runner, not the hook")
     def test_latency(self):
         self.seed()
         times = []

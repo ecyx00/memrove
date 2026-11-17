@@ -22,6 +22,7 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
       PYTHONIOENCODING: utf-8
       MEMROVE_V3_NO_SPAWN: '1'
+      MEMROVE_READER: local   # the suite acts as the owner in a terminal; without it a CI shell reads as an untrusted reader
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
