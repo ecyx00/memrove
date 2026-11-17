@@ -6,7 +6,9 @@ A new agent session starts with no memory of the last one, so you brief it again
 
 It works with Claude Code and Codex. The command-line tool is `memrove`.
 
-![Memory graph of a real install, labels removed](docs/graph.png)
+![Link graph of the author's memory: 3,003 notes and 3,783 links, labels removed](docs/graph.png)
+
+<sub>The author's own memory: 3,003 linked notes, labels removed. Each dot is a note, its colour is its kind, and a bigger dot has more links.</sub>
 
 ## What you get
 
@@ -34,28 +36,30 @@ The install writes into the vault only. Add `--global` to connect memrove to eve
 
 ## Use
 
-The examples use the `memrove` command. Without `--global`, type `python3 ~/memory/memrove.py` in its place.
+The examples come from a demo project, a todo app, over two weeks of sessions. They use the `memrove` command. Without `--global`, type `python3 ~/memory/memrove.py` in its place.
 
-Save a decision, then find it in a later session:
+**A new session starts with a short note.** It holds how to search, the reading rules and the handoff card of the last session. Nothing else is loaded until the agent asks for it.
 
-```sh
-memrove remember "The API uses SQLite, not Postgres" --kind decision --why "one file, no server to operate"
-memrove search "sqlite postgres"
-```
+![What a new Claude Code session receives at start: the usage note and the last handoff card](docs/session-start.png)
 
-```
-rec:obs-40e269a159a22f962865f4f9|2026-11-17|decision|The API uses SQLite, not Postgres
-```
-
-![memrove search, then zoom, finds a past decision in a demo vault](docs/search-zoom.png)
-
-Replace it when the decision changes. The old record is kept and marked:
+**The agent searches when it needs the past.** One query returns chat messages, saved records and project docs. `zoom` opens a hit down to the original message.
 
 ```sh
-memrove remember "The API moved to Postgres" --kind decision --why "two writers now" --replaces obs-40e269
+memrove search "websockets sync"
+memrove zoom 4 1
 ```
 
-![memrove remember with a replaced record](docs/records.png)
+![memrove search returns messages, records and docs; zoom opens the original message](docs/search-zoom.png)
+
+**Decisions are saved with their reason, and replaced when they change.** The old record stays as history and says what replaced it:
+
+```sh
+memrove remember "Sync over plain REST every 30 seconds, no websockets" --kind decision --why "the hosting plan has no sticky sessions"
+memrove remember "Sync over websockets with a 5 second REST fallback" --kind decision --why "hosting moved to a plan with sticky sessions" --replaces obs-ffc304
+memrove show obs-ffc304
+```
+
+![memrove show on a replaced decision: the REPLACED line comes first](docs/records.png)
 
 | Command | What it does |
 | --- | --- |
@@ -90,7 +94,7 @@ flowchart LR
 
 1. **Hooks** in Claude Code and Codex write each message to the chat log. Adapters for Hermes, OpenCode and OMP are in `template/.claude/scripts/`.
 2. **The summary tree** is built over the log by a small model (Claude Haiku, through your Claude Code login). Set `MEMROVE_NO_LLM=1` to turn the Haiku calls off. Search and records work without them.
-3. **Typed records** are Markdown files in the vault. Links between them are `[[links]]`, so Obsidian's graph view or `memrove graph` shows the memory.
+3. **Typed records** are Markdown files in the vault. Links between them are `[[links]]`, so Obsidian's graph view shows the memory. `memrove graph neighbors <id>` lists the links of one record.
 4. **The agent reads** through the CLI. The `mods/memrove-chat` plugin also gives Claude Code the model tools `zoom`, `date` and `project` (`claude --plugin-dir mods/memrove-chat`).
 
 A record can cite the message it came from, and the code checks the quote before it saves. A reader other than Claude Code, Codex or your own terminal sees only the records its tier allows (`MEMROVE_READER`).
