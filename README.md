@@ -1,7 +1,5 @@
 # memrove
 
-[![tests](https://github.com/ecyx00/memrove/actions/workflows/v3.yml/badge.svg)](https://github.com/ecyx00/memrove/actions/workflows/v3.yml)
-
 **Long-term memory for AI coding agents. Local, plain files, no server.**
 
 A new agent session starts with no memory of the last one, so you brief it again. memrove keeps every message of every session, the decisions you made and the reasons for them. The next session reads its memory and continues the work.
